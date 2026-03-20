@@ -26,6 +26,7 @@ html, body {
   color: var(--text);
   overflow: hidden;
   height: 100vh;
+  width: 100vw;
   display: flex;
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
@@ -45,7 +46,8 @@ input, select, textarea { font-family: inherit; }
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  min-width: 0;       /* CRITICAL: prevents flex child from overflowing */
+  width: 0;           /* forces flex to calculate width correctly */
 }
 
 .page {
@@ -53,12 +55,15 @@ input, select, textarea { font-family: inherit; }
   flex: 1;
   overflow: hidden;
   min-height: 0;
+  min-width: 0;
   flex-direction: column;
+  width: 100%;
 }
 .page.active {
   display: flex;
   flex-direction: column;
   height: 100%;
+  width: 100%;
 }
 
 .panel-header {
@@ -74,6 +79,7 @@ input, select, textarea { font-family: inherit; }
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
 }
 
 .panel-header .header-actions {
