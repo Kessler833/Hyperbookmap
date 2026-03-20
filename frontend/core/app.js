@@ -1,5 +1,5 @@
-// ── Router ────────────────────────────────────────────
-const pages = ['bookmap', 'config'];
+// ── Router ────────────────────────────────────────────────────────────
+const pages = ['bookmap', 'bot', 'config'];
 
 function showPage(name) {
   pages.forEach(p => {
@@ -7,6 +7,7 @@ function showPage(name) {
     document.querySelector(`.nav-item[data-page="${p}"]`)?.classList.toggle('active', p === name);
   });
   if (name === 'bookmap' && window.BookmapPage) BookmapPage.onShow();
+  if (name === 'bot'     && window.BotPage)     BotPage.onShow();
   if (name === 'config'  && window.ConfigPage)  ConfigPage.onShow();
 }
 
@@ -18,14 +19,14 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
   document.getElementById('sidebar').classList.toggle('collapsed');
 });
 
-// ── WebSocket connection to Python backend ──────────────────
+// ── WebSocket connection to Python backend ────────────────────────────
 const WS_URL = 'ws://127.0.0.1:8765/ws';
 let _ws = null;
 let _reconnectTimer = null;
 
 window.BackendWS = {
   handlers: {},
-  on(type, fn) { this.handlers[type] = fn; },
+  on(type, fn)  { this.handlers[type] = fn; },
   send(obj) {
     if (_ws && _ws.readyState === WebSocket.OPEN) {
       _ws.send(JSON.stringify(obj));
@@ -37,15 +38,15 @@ function connectBackend() {
   _ws = new WebSocket(WS_URL);
 
   _ws.onopen = () => {
-    console.log('[WS] Connected to backend');
+    console.log('[WS] Connected');
     if (window.BookmapPage) BookmapPage.onConnected();
   };
 
   _ws.onmessage = (evt) => {
     try {
       const msg = JSON.parse(evt.data);
-      const handler = BackendWS.handlers[msg.type];
-      if (handler) handler(msg);
+      const h   = BackendWS.handlers[msg.type];
+      if (h) h(msg);
     } catch(e) { console.error('[WS] parse error', e); }
   };
 
@@ -56,10 +57,7 @@ function connectBackend() {
     _reconnectTimer = setTimeout(connectBackend, 2000);
   };
 
-  _ws.onerror = (e) => {
-    console.error('[WS] Error:', e);
-    _ws.close();
-  };
+  _ws.onerror = () => _ws.close();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
