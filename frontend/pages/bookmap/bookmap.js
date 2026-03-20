@@ -1,19 +1,18 @@
 /* =============================================================
    HYPERBOOKMAP — Single Feed + AS Bot Overlay
 
-   - Single l2Book feed (nSigFigs=5)
-   - windowHalf = microTickSize * cfg.levels  (always from feed tick)
-   - Bot quote lines (bid=blue, ask=red) drawn on canvas
-   - Stats overlay: inventory, pnl, spread, sigma
-   - Fill bubbles: normal=trade, large=bot fill
+   - nSigFigs=5, max levels (500) = deep book visible
+   - windowHalf = tickSize * cfg.levels
+   - Bot: cyan bid line, orange ask line, large fill bubbles
    ============================================================= */
 
 window.BookmapPage = (() => {
 
+  // Pull saved coin from localStorage; levels fixed at 500 (max depth)
   let cfg = {
-    coin:      localStorage.getItem('bm_coin')    || 'BTC',
-    levels:    parseInt(localStorage.getItem('bm_levels') || '60'),
-    colWidth:  parseInt(localStorage.getItem('bm_speed')  || '4'),
+    coin:     localStorage.getItem('bm_coin') || 'BTC',
+    levels:   500,
+    colWidth: parseInt(localStorage.getItem('bm_speed') || '4'),
     maxBubble: 20,
   };
 
@@ -23,39 +22,32 @@ window.BookmapPage = (() => {
   let W = 0, H = 0;
   let dirty = false;
 
-  let midPrice  = null;
-  let tickSize  = null;
+  let midPrice   = null;
+  let tickSize   = null;
   let windowHalf = null;
 
-  // Bot state
   let bot = {
     running: false,
     bid_quote: null, ask_quote: null,
-    bid_size: 0, ask_size: 0,
-    inventory: 0, pnl_total: 0, pnl_realized: 0,
+    inventory: 0, pnl_total: 0,
     spread: 0, sigma: 0,
-    open_orders: [], recent_fills: [],
   };
 
   const MAX_COLS = 3000;
-  const colBuf  = [];
-  const bubbles = [];
-  const latest  = { bids: [], asks: [] };
+  const colBuf   = [];
+  const bubbles  = [];
+  const latest   = { bids: [], asks: [] };
 
-  // PnL history for mini chart in stats
-  const pnlHistory = [];
-  const MAX_PNL_HIST = 500;
-
-  // ── Colors ───────────────────────────────────────────────────
+  // ─ Colors ──────────────────────────────────────────────────
   const bidColor = n => `rgba(${Math.round(n*40)},${Math.round(n*200)},${Math.round(60+n*150)},${(0.1+n*0.9).toFixed(2)})`;
   const askColor = n => `rgba(${Math.round(60+n*195)},${Math.round(n*80)},${Math.round(n*20)},${(0.1+n*0.9).toFixed(2)})`;
 
-  // ── DOM ──────────────────────────────────────────────────────
+  // ─ DOM ─────────────────────────────────────────────────────
   function init() {
     const page = document.getElementById('page-bookmap');
     page.innerHTML = `
       <div id="bm-header">
-        <span>Bookmap</span>
+        <span style="color:var(--accent);font-weight:700">Hyperbookmap</span>
         <span id="bm-coin-badge">${cfg.coin}-PERP</span>
         <span id="bm-price">—</span>
         <span id="bm-spread"></span>
@@ -64,7 +56,23 @@ window.BookmapPage = (() => {
           <input id="bm-contrast" type="range" min="0" max="0.5" step="0.01" value="${contrast}">
           <span id="bm-contrast-val">${Math.round(contrast*100)}%</span>
         </div>
-        <div id="bm-bot-badge" class="bot-badge" id="bm-bot-badge">BOT OFF</div>
+        <!-- Coin changer -->
+        <div id="bm-coin-wrap">
+          <input id="bm-coin-input" type="text" value="${cfg.coin}" maxlength="10"
+            style="width:60px;text-transform:uppercase" placeholder="BTC">
+          <button id="bm-coin-go" class="bm-btn">Go</button>
+        </div>
+        <!-- Speed -->
+        <div id="bm-speed-wrap">
+          Speed
+          <select id="bm-speed">
+            <option value="2" ${cfg.colWidth==2?'selected':''}>Dense</option>
+            <option value="4" ${cfg.colWidth==4?'selected':''}>Normal</option>
+            <option value="6" ${cfg.colWidth==6?'selected':''}>Fast</option>
+            <option value="8" ${cfg.colWidth==8?'selected':''}>Faster</option>
+          </select>
+        </div>
+        <div id="bm-bot-badge" class="bot-badge">BOT OFF</div>
         <div id="bm-status">
           <div class="status-dot" id="bm-dot"></div>
           <span id="bm-status-text">Connecting…</span>
@@ -75,20 +83,18 @@ window.BookmapPage = (() => {
         <div id="bm-canvas-wrap">
           <canvas id="bm-canvas"></canvas>
 
-          <!-- Bot stats overlay (top-right) -->
+          <!-- Bot stats overlay -->
           <div id="bm-bot-overlay" class="hidden">
-            <div class="bov-row"><span class="bov-l">PnL</span><span class="bov-v" id="bov-pnl">—</span></div>
-            <div class="bov-row"><span class="bov-l">Inventory</span><span class="bov-v" id="bov-inv">—</span></div>
-            <div class="bov-row"><span class="bov-l">Spread</span><span class="bov-v" id="bov-spread">—</span></div>
-            <div class="bov-row"><span class="bov-l">σ</span><span class="bov-v" id="bov-sigma">—</span></div>
-            <div class="bov-row"><span class="bov-l">Bid Q</span><span class="bov-v bid-col" id="bov-bid">—</span></div>
-            <div class="bov-row"><span class="bov-l">Ask Q</span><span class="bov-v ask-col" id="bov-ask">—</span></div>
+            <div class="bov-row"><span class="bov-l">PnL</span>   <span class="bov-v" id="bov-pnl">—</span></div>
+            <div class="bov-row"><span class="bov-l">Inv</span>    <span class="bov-v" id="bov-inv">—</span></div>
+            <div class="bov-row"><span class="bov-l">Spread</span> <span class="bov-v" id="bov-spread">—</span></div>
+            <div class="bov-row"><span class="bov-l">σ</span>      <span class="bov-v" id="bov-sigma">—</span></div>
+            <div class="bov-row"><span class="bov-l">Bid</span>    <span class="bov-v bid-col" id="bov-bid">—</span></div>
+            <div class="bov-row"><span class="bov-l">Ask</span>    <span class="bov-v ask-col" id="bov-ask">—</span></div>
           </div>
 
           <div id="bm-overlay">
-            Range: ±<span id="ov-range">—</span> &nbsp;
-            Tick: <span id="ov-tick">—</span> &nbsp;
-            Levels: <span id="ov-levels">${cfg.levels}</span>
+            Tick: <span id="ov-tick">—</span> &nbsp; Range: ±<span id="ov-range">—</span>
           </div>
           <div id="bm-waiting">
             <div class="spinner"></div>
@@ -116,6 +122,7 @@ window.BookmapPage = (() => {
     resize();
     startLoop();
 
+    // Contrast
     document.getElementById('bm-contrast').addEventListener('input', e => {
       contrast = parseFloat(e.target.value);
       localStorage.setItem('bm_contrast', contrast);
@@ -123,9 +130,30 @@ window.BookmapPage = (() => {
       dirty = true;
     });
 
-    BackendWS.on('l2Book',     onBook);
-    BackendWS.on('trades',     onTrades);
-    BackendWS.on('bot_state',  onBotState);
+    // Coin change
+    const goBtn  = document.getElementById('bm-coin-go');
+    const coinIn = document.getElementById('bm-coin-input');
+    coinIn.addEventListener('input', e => { e.target.value = e.target.value.toUpperCase(); });
+    const applyCoin = () => {
+      const c = coinIn.value.trim().toUpperCase() || 'BTC';
+      cfg.coin = c;
+      localStorage.setItem('bm_coin', c);
+      setEl('bm-coin-badge', c + '-PERP');
+      resetState();
+      BackendWS.send({ type: 'set_coin', coin: c });
+    };
+    goBtn.addEventListener('click', applyCoin);
+    coinIn.addEventListener('keydown', e => { if (e.key === 'Enter') applyCoin(); });
+
+    // Speed
+    document.getElementById('bm-speed').addEventListener('change', e => {
+      cfg.colWidth = parseInt(e.target.value);
+      localStorage.setItem('bm_speed', cfg.colWidth);
+    });
+
+    BackendWS.on('l2Book',    onBook);
+    BackendWS.on('trades',    onTrades);
+    BackendWS.on('bot_state', onBotState);
     BackendWS.on('coin_changed', msg => {
       setEl('bm-coin-badge', msg.coin + '-PERP');
       resetState();
@@ -141,13 +169,12 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Window ────────────────────────────────────────────────────
+  // ─ Window ──────────────────────────────────────────────────
   function computeWindow() {
     if (!tickSize) return;
     windowHalf = tickSize * cfg.levels;
-    setEl('ov-range',  windowHalf.toFixed(windowHalf > 100 ? 0 : 2));
-    setEl('ov-tick',   'Δ' + tickSize.toFixed(tickSize < 10 ? 2 : 1));
-    setEl('ov-levels', cfg.levels);
+    setEl('ov-tick',  'Δ' + tickSize.toFixed(tickSize < 10 ? 2 : 1));
+    setEl('ov-range', windowHalf.toFixed(windowHalf > 100 ? 0 : 2));
   }
 
   function py(price) {
@@ -157,36 +184,31 @@ window.BookmapPage = (() => {
     return H - ((price - lo) / (hi - lo)) * H;
   }
 
-  // ── Book handler ─────────────────────────────────────────────
+  // ─ Book ─────────────────────────────────────────────────────
   function onBook(msg) {
     const bids = msg.bids || [], asks = msg.asks || [];
     if (!bids.length && !asks.length) return;
     latest.bids = bids; latest.asks = asks;
 
-    // Detect tick once
     if (!tickSize && bids.length >= 2) {
       const t = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
       if (t > 0) { tickSize = t; computeWindow(); }
     }
 
-    // Mid
     if (bids.length && asks.length) {
       const bb = parseFloat(bids[0].px), ba = parseFloat(asks[0].px);
       midPrice = (bb + ba) / 2;
-      const spread = ba - bb;
       setEl('bm-price', midPrice.toFixed(midPrice > 100 ? 1 : 4));
       const se = document.getElementById('bm-spread');
-      if (se) se.textContent = 'sprd ' + spread.toFixed(spread < 1 ? 4 : 1);
+      if (se) se.textContent = 'sprd ' + (ba - bb).toFixed((ba-bb) < 1 ? 4 : 1);
     }
 
-    // Push column
     if (midPrice !== null && windowHalf !== null) {
-      const snap = {
+      colBuf.push({
         mid:  midPrice,
         bids: bids.slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz) })),
         asks: asks.slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz) })),
-      };
-      colBuf.push(snap);
+      });
       if (colBuf.length > MAX_COLS) colBuf.shift();
     }
 
@@ -196,77 +218,60 @@ window.BookmapPage = (() => {
 
   function onTrades(msg) {
     if (!W || !H || midPrice === null) return;
-    const newestX = Math.floor((W - 58) * 0.85);
+    const nx = Math.floor((W - 58) * 0.85);
     for (const t of (msg.trades || [])) {
-      const price = parseFloat(t.px);
-      const size  = parseFloat(t.sz);
-      const y = py(price);
+      const y = py(parseFloat(t.px));
       if (y < 0 || y > H) continue;
-      const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(size) * 2));
-      bubbles.push({ x: newestX, y, r, side: t.side, alpha: 0.9, bot: false });
+      const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(parseFloat(t.sz)) * 2));
+      bubbles.push({ x: nx, y, r, side: t.side, alpha: 0.9, bot: false });
     }
     if (bubbles.length > 600) bubbles.splice(0, bubbles.length - 600);
     dirty = true;
   }
 
-  // ── Bot state handler ─────────────────────────────────────────
+  // ─ Bot state ───────────────────────────────────────────────
   function onBotState(msg) {
-    bot.running     = msg.running || false;
-    bot.bid_quote   = msg.bid_quote   ?? null;
-    bot.ask_quote   = msg.ask_quote   ?? null;
-    bot.bid_size    = msg.bid_size    ?? 0;
-    bot.ask_size    = msg.ask_size    ?? 0;
-    bot.inventory   = msg.inventory   ?? 0;
-    bot.pnl_total   = msg.pnl_total   ?? 0;
-    bot.pnl_realized = msg.pnl_realized ?? 0;
-    bot.spread      = msg.spread      ?? 0;
-    bot.sigma       = msg.sigma       ?? 0;
-    bot.open_orders  = msg.open_orders  || [];
-    bot.recent_fills = msg.recent_fills || [];
+    bot.running   = msg.running   || false;
+    bot.bid_quote = msg.bid_quote ?? null;
+    bot.ask_quote = msg.ask_quote ?? null;
+    bot.inventory = msg.inventory ?? 0;
+    bot.pnl_total = msg.pnl_total ?? 0;
+    bot.spread    = msg.spread    ?? 0;
+    bot.sigma     = msg.sigma     ?? 0;
 
-    // PnL history
-    pnlHistory.push(bot.pnl_total);
-    if (pnlHistory.length > MAX_PNL_HIST) pnlHistory.shift();
-
-    // Update overlay
-    const ov = document.getElementById('bm-bot-overlay');
+    const ov    = document.getElementById('bm-bot-overlay');
     const badge = document.getElementById('bm-bot-badge');
     if (bot.running) {
       ov?.classList.remove('hidden');
       if (badge) { badge.textContent = 'BOT LIVE'; badge.classList.add('live'); }
     } else {
       ov?.classList.add('hidden');
-      if (badge) { badge.textContent = 'BOT OFF'; badge.classList.remove('live'); }
+      if (badge) { badge.textContent = 'BOT OFF';  badge.classList.remove('live'); }
     }
 
-    const fmt = (v, d=4) => v?.toFixed(d) ?? '—';
-    const pnlSign = bot.pnl_total >= 0 ? '+' : '';
-    setEl('bov-pnl',    pnlSign + fmt(bot.pnl_total, 2) + ' USD');
-    setEl('bov-inv',    fmt(bot.inventory, 6) + ' ' + (cfg.coin || 'BTC'));
-    setEl('bov-spread', fmt(bot.spread, 4));
-    setEl('bov-sigma',  fmt(bot.sigma, 6));
-    setEl('bov-bid',    fmt(bot.bid_quote, midPrice > 100 ? 1 : 4));
-    setEl('bov-ask',    fmt(bot.ask_quote, midPrice > 100 ? 1 : 4));
+    const f = (v, d) => (typeof v === 'number') ? v.toFixed(d) : '—';
+    const sign = v => (v >= 0 ? '+' : '') + f(v, 2);
+    setEl('bov-pnl',    sign(bot.pnl_total) + ' USD');
+    setEl('bov-inv',    f(bot.inventory, 6));
+    setEl('bov-spread', f(bot.spread, 4));
+    setEl('bov-sigma',  f(bot.sigma, 6));
+    setEl('bov-bid',    f(bot.bid_quote, midPrice > 100 ? 1 : 4));
+    setEl('bov-ask',    f(bot.ask_quote, midPrice > 100 ? 1 : 4));
 
-    // Bot fill bubbles at their quote price
+    // Bot fill bubbles
     if (msg.recent_fills?.length) {
-      const newestX = Math.floor((W - 58) * 0.85);
-      for (const f of msg.recent_fills.slice(0, 3)) {
+      const nx = Math.floor((W - 58) * 0.85);
+      for (const f of msg.recent_fills.slice(0, 2)) {
         if (!f.price) continue;
         const y = py(f.price);
         if (y < 0 || y > H) continue;
-        bubbles.push({
-          x: newestX, y, r: 10,
-          side: f.side === 'bid' ? 'B' : 'A',
-          alpha: 1.0, bot: true,
-        });
+        bubbles.push({ x: nx, y, r: 12, side: f.side === 'bid' ? 'B' : 'A', alpha: 1.0, bot: true });
       }
     }
-
     dirty = true;
   }
 
-  // ── Orderbook panel ───────────────────────────────────────────
+  // ─ Orderbook panel ─────────────────────────────────────────
   function updateOrderbook() {
     const asksEl = document.getElementById('bm-ob-asks');
     const bidsEl = document.getElementById('bm-ob-bids');
@@ -275,7 +280,7 @@ window.BookmapPage = (() => {
     const asks = latest.asks.slice(0, 20);
     const bids = latest.bids.slice(0, 20);
     if (!asks.length && !bids.length) return;
-    const maxSz = Math.max(...[...asks, ...bids].map(x => parseFloat(x.sz)), 1);
+    const maxSz = Math.max(...[...asks,...bids].map(x => parseFloat(x.sz)), 1);
     const fmt   = p => parseFloat(p).toFixed(midPrice > 100 ? 1 : 4);
     asksEl.innerHTML = asks.map(a => {
       const sz = parseFloat(a.sz);
@@ -293,12 +298,12 @@ window.BookmapPage = (() => {
     colBuf.length = 0; bubbles.length = 0;
     midPrice = null; tickSize = null; windowHalf = null;
     latest.bids = []; latest.asks = [];
-    setEl('bm-price', '—'); setEl('ov-range', '—'); setEl('ov-tick', '—');
+    setEl('bm-price', '—'); setEl('ov-tick', '—'); setEl('ov-range', '—');
     ['bm-ob-asks','bm-ob-bids'].forEach(id => { const e = document.getElementById(id); if(e) e.innerHTML=''; });
     setEl('bm-ob-mid', '—');
   }
 
-  // ── Render loop ───────────────────────────────────────────────
+  // ─ Render loop ─────────────────────────────────────────────
   function startLoop() {
     (function loop() { if (dirty) { render(); dirty = false; } requestAnimationFrame(loop); })();
   }
@@ -308,14 +313,13 @@ window.BookmapPage = (() => {
     ctx.clearRect(0, 0, W, H);
     if (!colBuf.length || !windowHalf || midPrice === null) return;
 
-    const AXIS_W  = 58;
-    const HEAT_W  = W - AXIS_W;
-    const newestX = Math.floor(HEAT_W * 0.85);
-    const numCols = colBuf.length;
-    const visCols = Math.floor(newestX / cfg.colWidth) + 1;
+    const AXIS_W   = 58;
+    const HEAT_W   = W - AXIS_W;
+    const newestX  = Math.floor(HEAT_W * 0.85);
+    const numCols  = colBuf.length;
+    const visCols  = Math.floor(newestX / cfg.colWidth) + 1;
     const startIdx = Math.max(0, numCols - visCols);
 
-    // Normalise
     let maxSz = 0;
     for (let i = startIdx; i < numCols; i++) {
       const s = colBuf[i];
@@ -333,7 +337,7 @@ window.BookmapPage = (() => {
       ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(HEAT_W,y); ctx.stroke();
     }
 
-    // Heatmap columns
+    // Heatmap
     for (let col = 0; col < visCols; col++) {
       const si = startIdx + col;
       if (si >= numCols) break;
@@ -359,64 +363,61 @@ window.BookmapPage = (() => {
     ctx.moveTo(0,midY); ctx.lineTo(newestX+cfg.colWidth,midY);
     ctx.stroke(); ctx.setLineDash([]);
 
-    // ── Bot quote lines ──────────────────────────────────────────
-    if (bot.running && bot.bid_quote !== null) {
+    // Bot quote lines
+    if (bot.running && bot.bid_quote !== null && bot.ask_quote !== null) {
       const bidY = py(bot.bid_quote);
       const askY = py(bot.ask_quote);
-
-      // Bid line (cyan)
-      ctx.beginPath(); ctx.strokeStyle='rgba(0,210,180,0.85)';
       ctx.lineWidth=1.5; ctx.setLineDash([6,3]);
-      ctx.moveTo(0, bidY); ctx.lineTo(newestX+cfg.colWidth, bidY); ctx.stroke();
 
-      // Ask line (orange-red)
-      ctx.beginPath(); ctx.strokeStyle='rgba(255,120,80,0.85)';
-      ctx.moveTo(0, askY); ctx.lineTo(newestX+cfg.colWidth, askY); ctx.stroke();
+      ctx.beginPath(); ctx.strokeStyle='rgba(0,210,180,0.9)';
+      ctx.moveTo(0,bidY); ctx.lineTo(newestX+cfg.colWidth,bidY); ctx.stroke();
+
+      ctx.beginPath(); ctx.strokeStyle='rgba(255,120,80,0.9)';
+      ctx.moveTo(0,askY); ctx.lineTo(newestX+cfg.colWidth,askY); ctx.stroke();
       ctx.setLineDash([]);
 
-      // Labels
-      ctx.font = '10px Inter, monospace'; ctx.textAlign = 'right';
-      ctx.fillStyle = 'rgba(0,210,180,1)';
-      ctx.fillText('BID ' + bot.bid_quote.toFixed(midPrice > 100 ? 1 : 4), newestX-4, bidY-3);
-      ctx.fillStyle = 'rgba(255,120,80,1)';
-      ctx.fillText('ASK ' + bot.ask_quote.toFixed(midPrice > 100 ? 1 : 4), newestX-4, askY-3);
-      ctx.textAlign = 'left';
+      ctx.font='10px Inter,monospace'; ctx.textAlign='right';
+      ctx.fillStyle='rgba(0,210,180,1)';
+      ctx.fillText('BID ' + bot.bid_quote.toFixed(midPrice>100?1:4), newestX-4, bidY-3);
+      ctx.fillStyle='rgba(255,120,80,1)';
+      ctx.fillText('ASK ' + bot.ask_quote.toFixed(midPrice>100?1:4), newestX-4, askY-3);
+      ctx.textAlign='left';
     }
 
     // Price axis
-    ctx.fillStyle = 'rgba(10,10,20,0.7)';
-    ctx.fillRect(HEAT_W, 0, AXIS_W, H);
+    ctx.fillStyle='rgba(10,10,20,0.7)';
+    ctx.fillRect(HEAT_W,0,AXIS_W,H);
     ctx.beginPath(); ctx.strokeStyle='rgba(30,30,50,0.8)'; ctx.lineWidth=1;
     ctx.moveTo(HEAT_W,0); ctx.lineTo(HEAT_W,H); ctx.stroke();
 
     const lo    = midPrice - windowHalf;
     const range = windowHalf * 2;
-    ctx.font = '10px Inter, monospace'; ctx.textAlign = 'left';
+    ctx.font='10px Inter,monospace'; ctx.textAlign='left';
     for (let i = 0; i <= 12; i++) {
       const price = lo + (range/12)*i;
-      const y     = H - (i/12)*H;
-      ctx.fillStyle = 'rgba(108,112,134,0.9)';
-      ctx.fillText(price.toFixed(price > 100 ? 1 : 4), HEAT_W+4, y+3);
+      const y     = H  - (i/12)*H;
+      ctx.fillStyle='rgba(108,112,134,0.9)';
+      ctx.fillText(price.toFixed(price>100?1:4), HEAT_W+4, y+3);
     }
-    ctx.fillStyle='rgba(122,162,247,1)'; ctx.font='11px Inter, monospace';
-    ctx.fillText(midPrice.toFixed(midPrice > 100 ? 1 : 4), HEAT_W+4, midY+4);
+    ctx.fillStyle='rgba(122,162,247,1)'; ctx.font='11px Inter,monospace';
+    ctx.fillText(midPrice.toFixed(midPrice>100?1:4), HEAT_W+4, midY+4);
 
     // Bubbles
-    for (let i = bubbles.length-1; i >= 0; i--) {
+    for (let i = bubbles.length-1; i>=0; i--) {
       const b = bubbles[i];
       if (b.alpha <= 0) { bubbles.splice(i,1); continue; }
       ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
-      const base = b.side==='B' ? '166,227,161' : '239,83,80';
-      ctx.fillStyle   = `rgba(${base},${b.alpha.toFixed(2)})`;
-      ctx.strokeStyle = `rgba(${base},0.9)`;
+      const rgb = b.side==='B' ? '166,227,161' : '239,83,80';
+      ctx.fillStyle   = `rgba(${rgb},${b.alpha.toFixed(2)})`;
+      ctx.strokeStyle = `rgba(${rgb},0.9)`;
       ctx.lineWidth = b.bot ? 2.5 : 1;
       ctx.fill(); ctx.stroke();
-      b.alpha -= b.bot ? 0.006 : 0.003;
+      b.alpha -= b.bot ? 0.005 : 0.003;
     }
     if (bubbles.length) dirty = true;
   }
 
-  // ── Public ────────────────────────────────────────────────────
+  // ─ Public ──────────────────────────────────────────────────
   function onShow()  { resize(); dirty = true; }
 
   function onConnected() {
@@ -432,19 +433,6 @@ window.BookmapPage = (() => {
     document.getElementById('bm-waiting')?.classList.remove('hidden');
   }
 
-  function updateCfg(newCfg) {
-    Object.assign(cfg, newCfg);
-    localStorage.setItem('bm_coin',   cfg.coin);
-    localStorage.setItem('bm_levels', cfg.levels);
-    localStorage.setItem('bm_speed',  cfg.colWidth);
-    computeWindow();
-    resetState();
-    BackendWS.send({ type: 'set_coin', coin: cfg.coin });
-    setEl('bm-coin-badge', cfg.coin + '-PERP');
-  }
-
-  function getBotState() { return { ...bot }; }
-
   document.addEventListener('DOMContentLoaded', init);
-  return { onShow, onConnected, onDisconnected, updateCfg, getCfg: () => ({...cfg}), getBotState };
+  return { onShow, onConnected, onDisconnected, getCfg: () => ({...cfg}) };
 })();

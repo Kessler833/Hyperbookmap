@@ -8,7 +8,8 @@ function createWindow() {
     minWidth: 960,
     minHeight: 600,
     backgroundColor: '#0a0a14',
-    titleBarStyle: 'hiddenInset',
+    // titleBarStyle: 'hiddenInset' causes dragEvent ReferenceError on Windows
+    // Use default titlebar instead
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -24,11 +25,5 @@ function createWindow() {
 }
 
 app.whenReady().then(createWindow);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
