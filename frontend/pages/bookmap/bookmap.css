@@ -12,6 +12,7 @@
   width: 100%;
 }
 
+/* ── HEADER BAR ───────────────────────────────────────── */
 #bm-header {
   background: var(--surface2);
   border-bottom: 1px solid var(--border);
@@ -27,7 +28,6 @@
   flex-shrink: 0;
   width: 100%;
 }
-
 #bm-coin-badge {
   color: var(--accent);
   font-size: 13px;
@@ -35,7 +35,6 @@
   letter-spacing: 0;
   text-transform: none;
 }
-
 #bm-price {
   color: var(--text);
   font-size: 13px;
@@ -44,12 +43,44 @@
   text-transform: none;
   font-variant-numeric: tabular-nums;
 }
-
+#bm-spread {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+}
 #bm-status {
   margin-left: auto;
   display: flex;
   align-items: center;
+  gap: 10px;
+}
+
+/* Contrast slider in header */
+#bm-contrast-wrap {
+  display: flex;
+  align-items: center;
   gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0;
+  text-transform: none;
+}
+#bm-contrast {
+  -webkit-appearance: none;
+  width: 80px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border2);
+  outline: none;
+  cursor: pointer;
+}
+#bm-contrast::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
 }
 
 .status-dot {
@@ -59,33 +90,37 @@
   transition: background 0.3s;
 }
 .status-dot.live { background: var(--green); animation: pulse 2s infinite; }
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+/* ── BODY: heatmap + orderbook side by side ──────────────── */
+#bm-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
+/* ── CANVAS (heatmap) ────────────────────────────────── */
 #bm-canvas-wrap {
   flex: 1;
   position: relative;
   overflow: hidden;
   background: var(--bg);
-  width: 100%;
   min-width: 0;
   min-height: 0;
 }
-
 #bm-canvas {
   display: block;
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
 }
 
+/* overlay info top-left */
 #bm-overlay {
   position: absolute;
-  top: 10px; right: 10px;
+  top: 10px; left: 10px;
   background: rgba(10,10,20,0.82);
   border: 1px solid var(--border2);
   border-radius: 6px;
@@ -98,6 +133,7 @@
 }
 #bm-overlay span { color: var(--text); font-weight: 600; }
 
+/* waiting overlay */
 #bm-waiting {
   position: absolute;
   inset: 0;
@@ -112,3 +148,91 @@
   background: var(--bg);
 }
 #bm-waiting.hidden { display: none; }
+
+/* ── ORDERBOOK PANEL (right side) ──────────────────────── */
+#bm-ob {
+  width: 200px;
+  min-width: 200px;
+  border-left: 1px solid var(--border);
+  background: var(--surface2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+#bm-ob-header {
+  padding: 6px 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--faint);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+}
+
+#bm-ob-body {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* asks on top (red), bids on bottom (green) */
+#bm-ob-asks {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column-reverse; /* lowest ask at bottom = near mid */
+  min-height: 0;
+}
+#bm-ob-mid {
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+  text-align: center;
+}
+#bm-ob-bids {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column; /* highest bid at top = near mid */
+  min-height: 0;
+}
+
+.ob-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  position: relative;
+  flex-shrink: 0;
+}
+.ob-row:hover { background: var(--surface); }
+
+/* depth bar behind text */
+.ob-bar {
+  position: absolute;
+  top: 0; bottom: 0; right: 0;
+  opacity: 0.12;
+  pointer-events: none;
+  border-radius: 1px;
+}
+.ob-row.ask .ob-bar { background: var(--red); }
+.ob-row.bid .ob-bar { background: var(--green); }
+
+.ob-px  { font-weight: 600; }
+.ob-sz  { color: var(--muted); }
+.ob-row.ask .ob-px { color: var(--red); }
+.ob-row.bid .ob-px { color: var(--green); }

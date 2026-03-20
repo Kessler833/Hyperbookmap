@@ -6,7 +6,7 @@ window.ConfigPage = (() => {
     const page = document.getElementById('page-config');
     const cur  = window.BookmapPage ? BookmapPage.getCfg() : {
       coin:     localStorage.getItem('bm_coin')   || 'BTC',
-      levels:   localStorage.getItem('bm_levels') || '40',
+      levels:   localStorage.getItem('bm_levels') || '80',
       colWidth: localStorage.getItem('bm_speed')  || '4',
     };
 
@@ -28,9 +28,9 @@ window.ConfigPage = (() => {
 
           <div class="cfg-row">
             <label class="cfg-label">Depth Levels</label>
-            <span class="cfg-hint">Price levels above/below mid shown in heatmap (10–100)</span>
+            <span class="cfg-hint">Price levels above/below mid (10–200). Higher = wider price range visible.</span>
             <input id="cfg-levels" class="cfg-input" type="number"
-              value="${cur.levels}" min="10" max="100" step="5">
+              value="${cur.levels}" min="10" max="200" step="10">
           </div>
 
           <div class="cfg-row">
@@ -66,9 +66,8 @@ window.ConfigPage = (() => {
 
     document.getElementById('cfg-save-btn').addEventListener('click', () => {
       const coin   = (document.getElementById('cfg-coin').value.trim().toUpperCase() || 'BTC');
-      const levels = Math.min(100, Math.max(10, parseInt(document.getElementById('cfg-levels').value) || 40));
+      const levels = Math.min(200, Math.max(10, parseInt(document.getElementById('cfg-levels').value) || 80));
       const speed  = parseInt(document.getElementById('cfg-speed').value) || 4;
-
       if (window.BookmapPage) {
         BookmapPage.updateCfg({ coin, levels, colWidth: speed });
       } else {
@@ -76,20 +75,14 @@ window.ConfigPage = (() => {
         localStorage.setItem('bm_levels', levels);
         localStorage.setItem('bm_speed',  speed);
       }
-
       const msgEl = document.getElementById('cfg-saved-msg');
-      if (msgEl) {
-        msgEl.classList.add('show');
-        setTimeout(() => msgEl.classList.remove('show'), 2000);
-      }
+      if (msgEl) { msgEl.classList.add('show'); setTimeout(() => msgEl.classList.remove('show'), 2000); }
     });
 
     inited = true;
   }
 
   function onShow() { init(); }
-
   document.addEventListener('DOMContentLoaded', init);
-
   return { onShow };
 })();
