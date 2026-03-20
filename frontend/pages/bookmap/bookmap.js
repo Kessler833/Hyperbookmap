@@ -1,47 +1,60 @@
 /* =============================================================
-   HYPERBOOKMAP — Canvas renderer + Live Orderbook panel
+   HYPERBOOKMAP — Proper Bookmap renderer
+
+   HOW IT WORKS (like real Bookmap):
+   - Every l2Book snapshot = one vertical column on canvas
+   - Y-axis = price, centered around mid price
+   - The visible price window is fixed height around mid (e.g. ±N ticks)
+   - Every price level in that window gets a colored pixel/rect
+   - Brightness = order size at that level
+   - Columns scroll left, newest always on right
+   - 85% scroll: newest column drawn at x=85% of canvas width,
+     leaving 15% empty space on the right
    ============================================================= */
 
 window.BookmapPage = (() => {
   let cfg = {
     coin:      localStorage.getItem('bm_coin')            || 'BTC',
-    levels:    parseInt(localStorage.getItem('bm_levels') || '80'),   // default 80
+    levels:    parseInt(localStorage.getItem('bm_levels') || '80'),
     colWidth:  parseInt(localStorage.getItem('bm_speed')  || '4'),
     maxBubble: 20,
   };
 
-  // contrast threshold 0..1 — levels below this fraction of maxSz are hidden
+  // contrast: 0..1 — fraction of maxSz below which levels are hidden
   let contrast = parseFloat(localStorage.getItem('bm_contrast') || '0.05');
 
   let canvas, ctx, wrap;
   let W = 0, H = 0;
   let dirty = false;
 
-  let midPrice = null;
-  let tickSize = null;
-  let priceMin = null;
-  let priceMax = null;
+  let midPrice    = null;
+  let tickSize    = null;
 
-  const MAX_COLS = 2000;
-  const colBuf   = [];
-  const bubbles  = [];
+  // Fixed-height price window centered on mid (in price units)
+  // Derived once tickSize is known: windowHalf = levels * tickSize
+  let windowHalf  = null;  // half the visible price range
 
-  // Latest raw book for the orderbook panel
-  let latestBids = [];
-  let latestAsks = [];
+  const MAX_COLS  = 3000;
+  const colBuf    = [];   // [{bids:[{px,sz}], asks:[{px,sz}], mid}]
+  const bubbles   = [];
+
+  let latestBids  = [];
+  let latestAsks  = [];
 
   // ── Colors ─────────────────────────────────────────────
   function bidColor(norm) {
-    const r = Math.round(10  + norm * 30);
-    const g = Math.round(30  + norm * 180);
-    const b = Math.round(80  + norm * 120);
-    return `rgba(${r},${g},${b},${(0.15 + norm * 0.75).toFixed(2)})`;
+    // black → bright cyan/blue
+    const r = Math.round(norm * 40);
+    const g = Math.round(norm * 200);
+    const b = Math.round(60 + norm * 150);
+    return `rgba(${r},${g},${b},${(0.1 + norm * 0.9).toFixed(2)})`;
   }
   function askColor(norm) {
-    const r = Math.round(80  + norm * 175);
-    const g = Math.round(20  + norm * 60);
-    const b = Math.round(20  + norm * 30);
-    return `rgba(${r},${g},${b},${(0.15 + norm * 0.75).toFixed(2)})`;
+    // black → bright red/orange
+    const r = Math.round(60 + norm * 195);
+    const g = Math.round(norm * 80);
+    const b = Math.round(norm * 20);
+    return `rgba(${r},${g},${b},${(0.1 + norm * 0.9).toFixed(2)})`;
   }
 
   // ── DOM init ──────────────────────────────────────────
@@ -96,12 +109,10 @@ window.BookmapPage = (() => {
     ctx    = canvas.getContext('2d');
     wrap   = document.getElementById('bm-canvas-wrap');
 
-    const ro = new ResizeObserver(() => resize());
-    ro.observe(wrap);
+    new ResizeObserver(() => resize()).observe(wrap);
     resize();
     startLoop();
 
-    // Contrast slider
     document.getElementById('bm-contrast').addEventListener('input', e => {
       contrast = parseFloat(e.target.value);
       localStorage.setItem('bm_contrast', contrast);
@@ -132,6 +143,37 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
+  // ── Price window helpers ───────────────────────────────────
+  // The visible price window: [mid - windowHalf, mid + windowHalf]
+  // windowHalf is recalculated whenever tickSize or cfg.levels changes
+  function computeWindow() {
+    if (tickSize === null) return;
+    windowHalf = tickSize * cfg.levels;
+  }
+
+  // Convert price to Y pixel using the CURRENT mid as center
+  function priceToY(price) {
+    if (midPrice === null || windowHalf === null || windowHalf === 0) return H / 2;
+    const lo = midPrice - windowHalf;
+    const hi = midPrice + windowHalf;
+    // price==hi → y=0 (top), price==lo → y=H (bottom)
+    return H - ((price - lo) / (hi - lo)) * H;
+  }
+
+  // The Y coordinate a stored snapshot column used (it had its own mid)
+  function priceToYWithMid(price, snapMid) {
+    if (snapMid === null || windowHalf === null || windowHalf === 0) return H / 2;
+    const lo = snapMid - windowHalf;
+    const hi = snapMid + windowHalf;
+    return H - ((price - lo) / (hi - lo)) * H;
+  }
+
+  // How tall is one tick in pixels?
+  function tickPx() {
+    if (tickSize === null || windowHalf === null) return cfg.colWidth;
+    return Math.max(1, (H / (windowHalf * 2)) * tickSize);
+  }
+
   // ── Data handlers ───────────────────────────────────────
   function onBook(msg) {
     const bids = msg.bids || [];
@@ -141,9 +183,14 @@ window.BookmapPage = (() => {
     latestBids = bids;
     latestAsks = asks;
 
-    if (!tickSize && bids.length >= 2) {
+    // Derive tick size from first snapshot
+    if (tickSize === null && bids.length >= 2) {
       tickSize = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
-      setEl('ov-tick', tickSize.toFixed(tickSize < 1 ? 4 : 1));
+      if (tickSize === 0) tickSize = null; // guard
+      else {
+        computeWindow();
+        setEl('ov-tick', tickSize.toFixed(tickSize < 1 ? 4 : 1));
+      }
     }
 
     if (bids.length && asks.length) {
@@ -156,14 +203,15 @@ window.BookmapPage = (() => {
       if (spreadEl) spreadEl.textContent = 'sprd ' + spread.toFixed(spread < 1 ? 4 : 1);
     }
 
+    // Store full snapshot with its mid
     const snap = {
+      mid:  midPrice,
       bids: bids.slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz) })),
       asks: asks.slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz) })),
     };
     colBuf.push(snap);
     if (colBuf.length > MAX_COLS) colBuf.shift();
 
-    updatePriceRange(snap);
     updateOrderbook();
     dirty = true;
   }
@@ -171,29 +219,21 @@ window.BookmapPage = (() => {
   function onTrades(msg) {
     const trades = msg.trades || [];
     if (!W || !H || midPrice === null) return;
+    // 85% anchor: newest trades appear at 85% of width
+    const newestX = Math.floor(W * 0.85);
     trades.forEach(t => {
       const price = parseFloat(t.px);
       const size  = parseFloat(t.sz);
       const y = priceToY(price);
       if (y < 0 || y > H) return;
       const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(size) * 2));
-      bubbles.push({ x: W - cfg.colWidth * 2, y, r, side: t.side, alpha: 0.85 });
-      if (bubbles.length > 500) bubbles.splice(0, bubbles.length - 500);
+      bubbles.push({ x: newestX, y, r, side: t.side, alpha: 0.9 });
+      if (bubbles.length > 600) bubbles.splice(0, bubbles.length - 600);
     });
     dirty = true;
   }
 
-  function updatePriceRange(snap) {
-    const allPx = [...snap.bids.map(b => b.px), ...snap.asks.map(a => a.px)];
-    if (!allPx.length) return;
-    const lo = Math.min(...allPx);
-    const hi = Math.max(...allPx);
-    // Use a wider adaptive range — only expand, never contract (bookmap-style)
-    if (priceMin === null || lo < priceMin) priceMin = lo;
-    if (priceMax === null || hi > priceMax) priceMax = hi;
-  }
-
-  // ── Orderbook panel renderer ──────────────────────────────
+  // ── Orderbook panel ────────────────────────────────────────
   function updateOrderbook() {
     const asksEl = document.getElementById('bm-ob-asks');
     const bidsEl = document.getElementById('bm-ob-bids');
@@ -203,29 +243,21 @@ window.BookmapPage = (() => {
     const ROWS = 20;
     const asks = latestAsks.slice(0, ROWS);
     const bids = latestBids.slice(0, ROWS);
-
-    // max size for depth bars
     const allSz = [...asks.map(a => parseFloat(a.sz)), ...bids.map(b => parseFloat(b.sz))];
     const maxSz = allSz.length ? Math.max(...allSz) : 1;
 
+    const fmt = p => parseFloat(p).toFixed(midPrice > 100 ? 1 : 4);
+
     asksEl.innerHTML = asks.map(a => {
-      const sz   = parseFloat(a.sz);
-      const pct  = Math.round((sz / maxSz) * 100);
-      return `<div class="ob-row ask">
-        <div class="ob-bar" style="width:${pct}%"></div>
-        <span class="ob-px">${parseFloat(a.px).toFixed(midPrice > 100 ? 1 : 4)}</span>
-        <span class="ob-sz">${sz.toFixed(3)}</span>
-      </div>`;
+      const sz  = parseFloat(a.sz);
+      const pct = Math.round((sz / maxSz) * 100);
+      return `<div class="ob-row ask"><div class="ob-bar" style="width:${pct}%"></div><span class="ob-px">${fmt(a.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
     }).join('');
 
     bidsEl.innerHTML = bids.map(b => {
       const sz  = parseFloat(b.sz);
       const pct = Math.round((sz / maxSz) * 100);
-      return `<div class="ob-row bid">
-        <div class="ob-bar" style="width:${pct}%"></div>
-        <span class="ob-px">${parseFloat(b.px).toFixed(midPrice > 100 ? 1 : 4)}</span>
-        <span class="ob-sz">${sz.toFixed(3)}</span>
-      </div>`;
+      return `<div class="ob-row bid"><div class="ob-bar" style="width:${pct}%"></div><span class="ob-px">${fmt(b.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
     }).join('');
 
     if (midEl && midPrice !== null)
@@ -235,7 +267,7 @@ window.BookmapPage = (() => {
   function resetState() {
     colBuf.length = 0;
     bubbles.length = 0;
-    midPrice = null; priceMin = null; priceMax = null; tickSize = null;
+    midPrice = null; tickSize = null; windowHalf = null;
     latestBids = []; latestAsks = [];
     setEl('bm-price', '—');
     setEl('ov-tick',  '—');
@@ -245,15 +277,6 @@ window.BookmapPage = (() => {
     if (asksEl) asksEl.innerHTML = '';
     if (bidsEl) bidsEl.innerHTML = '';
     if (midEl)  midEl.textContent = '—';
-  }
-
-  // ── Coordinate ─────────────────────────────────────────────
-  function priceToY(price) {
-    if (priceMin === null || priceMax === null || priceMax === priceMin) return H / 2;
-    const padding = (priceMax - priceMin) * 0.05; // tighter padding = more levels visible
-    const lo = priceMin - padding;
-    const hi = priceMax + padding;
-    return H - ((price - lo) / (hi - lo)) * H;
   }
 
   // ── Render loop ─────────────────────────────────────────
@@ -268,103 +291,136 @@ window.BookmapPage = (() => {
     if (!ctx || !W || !H) return;
     ctx.clearRect(0, 0, W, H);
 
-    const numCols = colBuf.length;
-    if (numCols === 0) return;
+    if (colBuf.length === 0 || windowHalf === null || midPrice === null) return;
 
-    const visibleCols = Math.floor(W / cfg.colWidth);
+    // ── Layout constants ────────────────────────────────────
+    const AXIS_W     = 58;          // px reserved for price axis on right
+    const HEAT_W     = W - AXIS_W;  // canvas width for heatmap columns
+    const ANCHOR     = 0.85;        // newest column at 85% of HEAT_W
+    const newestX    = Math.floor(HEAT_W * ANCHOR);
+    const numCols    = colBuf.length;
+
+    // How many columns fit from 0 to newestX?
+    const visibleCols = Math.floor(newestX / cfg.colWidth) + 1;
     const startIdx    = Math.max(0, numCols - visibleCols);
 
-    // Normalize across visible window
+    // Pixel height of one tick
+    const tPx = tickPx();
+    const rowH = Math.max(1, tPx);
+
+    // ── Global normalize: max order size across visible window ──
     let maxSz = 0;
     for (let i = startIdx; i < numCols; i++) {
       const s = colBuf[i];
-      s.bids.forEach(b => { if (b.sz > maxSz) maxSz = b.sz; });
-      s.asks.forEach(a => { if (a.sz > maxSz) maxSz = a.sz; });
+      for (const b of s.bids) if (b.sz > maxSz) maxSz = b.sz;
+      for (const a of s.asks) if (a.sz > maxSz) maxSz = a.sz;
     }
     if (maxSz === 0) return;
 
-    const threshold = contrast * maxSz; // contrast filter cutoff
+    const threshold = contrast * maxSz;
+
+    // ── Draw grid lines ────────────────────────────────────
+    ctx.strokeStyle = 'rgba(30,30,50,0.5)';
+    ctx.lineWidth   = 1;
+    const gridSteps = 10;
+    for (let i = 0; i <= gridSteps; i++) {
+      const y = Math.round((i / gridSteps) * H);
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(HEAT_W, y);
+      ctx.stroke();
+    }
+
+    // ── Draw heatmap columns ───────────────────────────────
+    // Each stored snapshot is rendered as one vertical column.
+    // X position: newest at newestX, older columns to the left.
+    // Y position: computed from that snapshot's own mid price
+    //             so the price ladder is stable relative to mid.
 
     for (let col = 0; col < visibleCols; col++) {
       const snapIdx = startIdx + col;
       if (snapIdx >= numCols) break;
       const snap = colBuf[snapIdx];
-      const x = col * cfg.colWidth;
+      const snapMid = snap.mid;
+      if (snapMid === null) continue;
 
-      snap.bids.forEach(b => {
-        if (b.sz < threshold) return; // contrast filter
-        const y    = priceToY(b.px);
+      // x of this column (older = further left)
+      const colsFromNewest = (numCols - 1) - snapIdx;
+      const x = newestX - colsFromNewest * cfg.colWidth;
+      if (x + cfg.colWidth < 0) continue; // off-screen left
+
+      for (const b of snap.bids) {
+        if (b.sz < threshold) continue;
         const norm = b.sz / maxSz;
+        const y    = priceToYWithMid(b.px, snapMid);
         ctx.fillStyle = bidColor(norm);
-        ctx.fillRect(x, y - cfg.colWidth * 0.5, cfg.colWidth, cfg.colWidth);
-      });
+        ctx.fillRect(x, y - rowH * 0.5, cfg.colWidth, rowH);
+      }
 
-      snap.asks.forEach(a => {
-        if (a.sz < threshold) return; // contrast filter
-        const y    = priceToY(a.px);
+      for (const a of snap.asks) {
+        if (a.sz < threshold) continue;
         const norm = a.sz / maxSz;
+        const y    = priceToYWithMid(a.px, snapMid);
         ctx.fillStyle = askColor(norm);
-        ctx.fillRect(x, y - cfg.colWidth * 0.5, cfg.colWidth, cfg.colWidth);
-      });
+        ctx.fillRect(x, y - rowH * 0.5, cfg.colWidth, rowH);
+      }
     }
 
-    drawPriceAxis();
+    // ── Mid price line (at current mid, drawn at newestX anchor) ──
+    const midY = priceToY(midPrice);
+    ctx.beginPath();
+    ctx.strokeStyle = 'rgba(122,162,247,0.9)';
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.moveTo(0, midY);
+    ctx.lineTo(newestX + cfg.colWidth, midY);
+    ctx.stroke();
+    ctx.setLineDash([]);
 
-    // Mid price line
-    if (midPrice !== null) {
-      const y = priceToY(midPrice);
-      ctx.beginPath();
-      ctx.strokeStyle = 'rgba(122,162,247,0.8)';
-      ctx.lineWidth   = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.moveTo(0, y);
-      ctx.lineTo(W, y);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    // ── Price axis (right of heatmap) ────────────────────────
+    ctx.fillStyle   = 'rgba(10,10,20,0.7)';
+    ctx.fillRect(HEAT_W, 0, AXIS_W, H);
+    ctx.strokeStyle = 'rgba(30,30,50,0.8)';
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.moveTo(HEAT_W, 0);
+    ctx.lineTo(HEAT_W, H);
+    ctx.stroke();
+
+    ctx.font      = '10px Inter, monospace';
+    ctx.fillStyle = 'rgba(108,112,134,0.9)';
+    ctx.textAlign = 'left';
+    const lo = midPrice - windowHalf;
+    const hi = midPrice + windowHalf;
+    const range = hi - lo;
+    const steps = 12;
+    for (let i = 0; i <= steps; i++) {
+      const price = lo + (range / steps) * i;
+      const y     = H - (i / steps) * H;
+      ctx.fillText(price.toFixed(price > 100 ? 1 : 4), HEAT_W + 4, y + 3);
     }
 
-    // Trade bubbles
+    // Highlight mid price label
+    ctx.fillStyle = 'rgba(122,162,247,1)';
+    ctx.font      = '11px Inter, monospace';
+    ctx.fillText(midPrice.toFixed(midPrice > 100 ? 1 : 4), HEAT_W + 4, midY + 4);
+
+    // ── Trade bubbles ────────────────────────────────────────
     for (let i = bubbles.length - 1; i >= 0; i--) {
       const b = bubbles[i];
       if (b.alpha <= 0) { bubbles.splice(i, 1); continue; }
       ctx.beginPath();
       ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
-      ctx.fillStyle   = b.side === 'B' ? `rgba(166,227,161,${b.alpha.toFixed(2)})` : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
+      ctx.fillStyle   = b.side === 'B'
+        ? `rgba(166,227,161,${b.alpha.toFixed(2)})`
+        : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
       ctx.strokeStyle = b.side === 'B' ? 'rgba(166,227,161,0.9)' : 'rgba(239,83,80,0.9)';
       ctx.lineWidth   = 1;
       ctx.fill();
       ctx.stroke();
-      b.alpha -= 0.004;
+      b.alpha -= 0.003;
     }
     if (bubbles.length > 0) dirty = true;
-  }
-
-  function drawPriceAxis() {
-    if (priceMin === null || priceMax === null) return;
-    const padding = (priceMax - priceMin) * 0.05;
-    const lo = priceMin - padding;
-    const hi = priceMax + padding;
-    const range = hi - lo;
-    if (range <= 0) return;
-
-    const steps = 10;
-    ctx.font      = '10px Inter, monospace';
-    ctx.fillStyle = 'rgba(108,112,134,0.7)';
-    ctx.textAlign = 'right';
-    // Draw tick lines
-    ctx.strokeStyle = 'rgba(30,30,48,0.6)';
-    ctx.lineWidth   = 1;
-
-    for (let i = 0; i <= steps; i++) {
-      const price = lo + (range / steps) * i;
-      const y     = H - (i / steps) * H;
-      // subtle grid line
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(W, y);
-      ctx.stroke();
-      ctx.fillText(price.toFixed(price > 100 ? 1 : 4), W - 6, y - 2);
-    }
   }
 
   // ── Public API ───────────────────────────────────────────
@@ -388,10 +444,12 @@ window.BookmapPage = (() => {
     localStorage.setItem('bm_coin',   cfg.coin);
     localStorage.setItem('bm_levels', cfg.levels);
     localStorage.setItem('bm_speed',  cfg.colWidth);
+    // Recompute window if levels changed
+    computeWindow();
     resetState();
     BackendWS.send({ type: 'set_coin', coin: cfg.coin });
     setEl('bm-coin-badge', cfg.coin + '-PERP');
-    setEl('ov-coin',  cfg.coin);
+    setEl('ov-coin',   cfg.coin);
     setEl('ov-levels', cfg.levels);
   }
 
