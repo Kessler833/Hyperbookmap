@@ -1,39 +1,75 @@
 """
-Hyperbookmap Backend — Dual Feed
+Hyperbookmap Backend — Single Feed + AS Paper Trading Engine
 
-Two parallel Hyperliquid WebSocket connections per coin:
-  FEED_MICRO : nSigFigs=5  — $1/tick,   ±50 range   (precise near mid)
-  FEED_WIDE  : nSigFigs=3  — $100/tick, ±5000 range (walls far from mid)
+One Hyperliquid WS feed (nSigFigs=5).
+AS engine runs in a background thread, quotes via PaperExecutor.
+All state is broadcast to frontend via /ws.
 
-Frontend receives both streams tagged with {feed: 'micro'} or {feed: 'wide'}.
-The frontend blends them: micro has priority near mid, wide fills the rest.
+Message types sent to frontend:
+  l2Book     — orderbook snapshot
+  trades     — trade ticks
+  bot_state  — AS engine state (quotes, inventory, pnl, fills)
+  coin_changed
+
+Messages received from frontend:
+  set_coin   — change coin
+  set_bot    — start/stop/update AS params
 """
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import sys
+import threading
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+import numpy as np
 import uvicorn
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+# Make core importable from project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from core.model import ASModel
+from core.inventory import InventoryManager
+from core.pnl import PnLState, Fill
+from core.paper_executor import PaperExecutor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("hyperbookmap")
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
+# ── Global state ───────────────────────────────────────────────────────────────
 clients: set[WebSocket] = set()
 current_coin: str = "BTC"
 coin_lock = asyncio.Lock()
 
-FEEDS = {
-    "micro": 5,   # nSigFigs=5: tight, precise
-    "wide":  3,   # nSigFigs=3: far walls
-}
+# AS Bot state
+bot_cfg = dict(
+    running=False,
+    gamma=0.1, kappa=1.5, eta=0.005,
+    base_order_size=0.001, T_hours=8.0, sigma_window=100,
+)
+bot_lock = threading.Lock()
+
+# Shared objects (re-created on every bot start)
+_model:    ASModel         | None = None
+_inv_mgr:  InventoryManager| None = None
+_executor: PaperExecutor   | None = None
+_pnl:      PnLState        | None = None
+_bot_thread: threading.Thread | None = None
+
+# Last mid price updated by feed task
+_mid_price: float | None = None
+_mid_lock = threading.Lock()
 
 
+# ── Broadcast ─────────────────────────────────────────────────────────────────
 async def broadcast(msg: dict):
     dead = set()
     for ws in list(clients):
@@ -44,104 +80,268 @@ async def broadcast(msg: dict):
     clients.difference_update(dead)
 
 
-async def hl_feed(feed_name: str, n_sig_figs: int):
-    """One persistent feed connection. Reconnects on coin change or error."""
-    global current_coin
+# ── Bot thread (sync, runs engine ticks) ──────────────────────────────────────
+def _bot_worker(loop: asyncio.AbstractEventLoop):
+    """Runs in a daemon thread. Ticks the AS model every ~1 s."""
+    global _model, _inv_mgr, _executor, _pnl
+
+    with bot_lock:
+        cfg = dict(bot_cfg)
+
+    model    = ASModel(gamma=cfg['gamma'], kappa=cfg['kappa'],
+                       sigma_window=cfg['sigma_window'], T_hours=cfg['T_hours'])
+    inv_mgr  = InventoryManager(eta=cfg['eta'], base_order_size=cfg['base_order_size'])
+    executor = PaperExecutor(base_order_size=cfg['base_order_size'])
+    pnl      = PnLState()
+
+    with bot_lock:
+        _model    = model
+        _inv_mgr  = inv_mgr
+        _executor = executor
+        _pnl      = pnl
+
+    bid_id: str | None = None
+    ask_id: str | None = None
+    one_side_ts: float | None = None
+    WAIT = 5.0
+
+    log.info("[bot] AS engine started")
+
+    while True:
+        with bot_lock:
+            if not bot_cfg['running']:
+                break
+            cfg = dict(bot_cfg)
+
+        with _mid_lock:
+            mid = _mid_price
+        if mid is None:
+            time.sleep(0.5)
+            continue
+
+        now = time.time()
+        model.update(mid, now)
+        pnl.mid_history.append(mid)
+        pnl.equity_curve.append(pnl.total)
+
+        quote = model.quotes(mid, pnl.inventory)
+        sized = inv_mgr.size_orders(quote.bid, quote.ask, pnl.inventory)
+
+        # Check fills
+        bid_fill = executor.get_fill(bid_id) if bid_id else None
+        ask_fill = executor.get_fill(ask_id) if ask_id else None
+
+        if bid_fill:
+            pnl.record_fill(Fill('bid', bid_fill[0], bid_fill[1], now, pnl.inventory))
+            executor.cancel(bid_id)
+            bid_id = None
+            if ask_id and one_side_ts is None:
+                one_side_ts = now
+
+        if ask_fill:
+            if len(pnl.fills) >= 2 and pnl.fills[-2].side == 'bid':
+                sp = ask_fill[0] - pnl.fills[-2].price
+                if sp > 0:
+                    pnl.spread_captured.append(sp)
+            pnl.record_fill(Fill('ask', ask_fill[0], ask_fill[1], now, pnl.inventory))
+            executor.cancel(ask_id)
+            ask_id = None
+            if bid_id and one_side_ts is None:
+                one_side_ts = now
+
+        # Requote logic
+        if bid_id is None and ask_id is None:
+            one_side_ts = None
+            bid_id = executor.post_bid(sized.bid_price, sized.bid_size)
+            ask_id = executor.post_ask(sized.ask_price, sized.ask_size)
+        elif one_side_ts and (now - one_side_ts) >= WAIT:
+            for oid in [bid_id, ask_id]:
+                if oid:
+                    executor.cancel(oid)
+            bid_id = ask_id = one_side_ts = None
+            bid_id = executor.post_bid(sized.bid_price, sized.bid_size)
+            ask_id = executor.post_ask(sized.ask_price, sized.ask_size)
+
+        # Broadcast bot state to frontend
+        open_orders = executor.open_orders()
+        recent      = executor.recent_fills(10)
+        state_msg   = {
+            'type':        'bot_state',
+            'running':     True,
+            'bid_quote':   round(sized.bid_price, 4),
+            'ask_quote':   round(sized.ask_price, 4),
+            'bid_size':    sized.bid_size,
+            'ask_size':    sized.ask_size,
+            'inventory':   round(pnl.inventory, 6),
+            'pnl_realized':   round(pnl.realized, 4),
+            'pnl_unrealized': round(pnl.unrealized, 4),
+            'pnl_total':      round(pnl.total, 4),
+            'spread':      round(quote.spread, 4),
+            'sigma':       round(quote.sigma, 8),
+            'reservation': round(quote.reservation, 4),
+            'open_orders': open_orders,
+            'recent_fills': recent,
+        }
+        asyncio.run_coroutine_threadsafe(broadcast(state_msg), loop)
+
+        time.sleep(cfg.get('tick_interval', 1.0))
+
+    log.info("[bot] AS engine stopped")
+    asyncio.run_coroutine_threadsafe(
+        broadcast({'type': 'bot_state', 'running': False}), loop
+    )
+
+
+def _start_bot(loop):
+    global _bot_thread
+    if _bot_thread and _bot_thread.is_alive():
+        return
+    _bot_thread = threading.Thread(target=_bot_worker, args=(loop,), daemon=True, name="as-engine")
+    _bot_thread.start()
+
+
+def _stop_bot():
+    with bot_lock:
+        bot_cfg['running'] = False
+
+
+# ── HL Feed task ───────────────────────────────────────────────────────────────
+async def hl_feed():
+    global current_coin, _mid_price
 
     while True:
         coin = current_coin
-        log.info(f"[{feed_name}] Connecting: coin={coin} nSigFigs={n_sig_figs}")
+        log.info(f"[feed] Connecting: coin={coin}")
         try:
             async with websockets.connect(HL_WS_URL, ping_interval=20) as ws:
                 await ws.send(json.dumps({
-                    "method": "subscribe",
-                    "subscription": {
-                        "type": "l2Book",
-                        "coin": coin,
-                        "nSigFigs": n_sig_figs
-                    }
+                    'method': 'subscribe',
+                    'subscription': {'type': 'l2Book', 'coin': coin, 'nSigFigs': 5}
                 }))
-                # Only micro feed subscribes to trades (avoid duplicate trade events)
-                if feed_name == "micro":
-                    await ws.send(json.dumps({
-                        "method": "subscribe",
-                        "subscription": {"type": "trades", "coin": coin}
-                    }))
-
-                log.info(f"[{feed_name}] Subscribed l2Book(nSigFigs={n_sig_figs}) for {coin}")
+                await ws.send(json.dumps({
+                    'method': 'subscribe',
+                    'subscription': {'type': 'trades', 'coin': coin}
+                }))
+                log.info(f"[feed] Subscribed l2Book+trades for {coin}")
 
                 while True:
                     if current_coin != coin:
-                        log.info(f"[{feed_name}] Coin changed, reconnecting...")
                         break
-
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
                         continue
 
                     data    = json.loads(raw)
-                    channel = data.get("channel", "")
+                    channel = data.get('channel', '')
 
-                    if channel == "l2Book":
-                        book_data = data.get("data", {})
-                        levels    = book_data.get("levels", [[], []])
-                        bids      = levels[0] if len(levels) > 0 else []
-                        asks      = levels[1] if len(levels) > 1 else []
+                    if channel == 'l2Book':
+                        book    = data.get('data', {})
+                        levels  = book.get('levels', [[], []])
+                        bids    = levels[0] if len(levels) > 0 else []
+                        asks    = levels[1] if len(levels) > 1 else []
+
+                        # Update mid price for bot
+                        if bids and asks:
+                            with _mid_lock:
+                                _mid_price = (float(bids[0]['px']) + float(asks[0]['px'])) / 2
+
                         await broadcast({
-                            "type":  "l2Book",
-                            "feed":  feed_name,   # <-- tagged!
-                            "coin":  coin,
-                            "bids":  bids,
-                            "asks":  asks,
-                            "time":  book_data.get("time", 0),
+                            'type': 'l2Book', 'coin': coin,
+                            'bids': bids, 'asks': asks,
+                            'time': book.get('time', 0),
                         })
 
-                    elif channel == "trades" and feed_name == "micro":
-                        trades = data.get("data", [])
+                    elif channel == 'trades':
+                        trades = data.get('data', [])
                         if trades:
-                            await broadcast({"type": "trades", "coin": coin, "trades": trades})
+                            # Notify paper executor of each trade
+                            with bot_lock:
+                                exec_ref = _executor
+                            if exec_ref:
+                                for t in trades:
+                                    try:
+                                        exec_ref.notify_trade(
+                                            float(t['px']),
+                                            t.get('side', 'B'),
+                                            float(t['sz']),
+                                        )
+                                    except Exception:
+                                        pass
+                            await broadcast({'type': 'trades', 'coin': coin, 'trades': trades})
 
         except Exception as e:
-            log.error(f"[{feed_name}] Error: {e}. Reconnecting in 3s...")
+            log.error(f"[feed] Error: {e}. Reconnecting in 3s...")
             await asyncio.sleep(3)
 
 
+# ── FastAPI app ────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Launch both feeds concurrently
-    for feed_name, n_sig_figs in FEEDS.items():
-        asyncio.create_task(hl_feed(feed_name, n_sig_figs))
+    loop = asyncio.get_event_loop()
+    app.state.loop = loop
+    asyncio.create_task(hl_feed())
     yield
 
 
 app = FastAPI(title="Hyperbookmap Backend", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 
-@app.websocket("/ws")
+@app.get('/health')
+async def health():
+    return {'status': 'ok'}
+
+
+@app.websocket('/ws')
 async def frontend_ws(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
-    log.info(f"Frontend connected. Clients: {len(clients)}")
+    log.info(f'Frontend connected. Clients: {len(clients)}')
+    loop = asyncio.get_event_loop()
     try:
         while True:
             msg  = await ws.receive_text()
             data = json.loads(msg)
-            if data.get("type") == "set_coin":
-                new_coin = data.get("coin", "BTC").upper().strip()
+            t    = data.get('type')
+
+            if t == 'set_coin':
+                new_coin = data.get('coin', 'BTC').upper().strip()
                 async with coin_lock:
                     global current_coin
                     current_coin = new_coin
-                log.info(f"Coin set to: {new_coin}")
-                await broadcast({"type": "coin_changed", "coin": new_coin})
+                log.info(f'Coin → {new_coin}')
+                await broadcast({'type': 'coin_changed', 'coin': new_coin})
+
+            elif t == 'set_bot':
+                action = data.get('action', 'update')  # start | stop | update
+                with bot_lock:
+                    if 'gamma'  in data: bot_cfg['gamma']  = float(data['gamma'])
+                    if 'kappa'  in data: bot_cfg['kappa']  = float(data['kappa'])
+                    if 'eta'    in data: bot_cfg['eta']    = float(data['eta'])
+                    if 'base_order_size' in data:
+                        bot_cfg['base_order_size'] = float(data['base_order_size'])
+                    if 'T_hours' in data: bot_cfg['T_hours'] = float(data['T_hours'])
+                    if action == 'start':
+                        bot_cfg['running'] = True
+                    elif action == 'stop':
+                        bot_cfg['running'] = False
+
+                if action == 'start':
+                    _start_bot(loop)
+                    log.info('[bot] start requested')
+                elif action == 'stop':
+                    _stop_bot()
+                    log.info('[bot] stop requested')
+
+                await ws.send_text(json.dumps({'type': 'bot_cfg_ack', **bot_cfg}))
+
     except WebSocketDisconnect:
         clients.discard(ws)
-        log.info(f"Frontend disconnected. Clients: {len(clients)}")
     except Exception as e:
         clients.discard(ws)
-        log.error(f"WS error: {e}")
+        log.error(f'WS error: {e}')
 
 
-if __name__ == "__main__":
-    uvicorn.run("server:app", host="127.0.0.1", port=8765, reload=False)
+if __name__ == '__main__':
+    uvicorn.run('server:app', host='127.0.0.1', port=8765, reload=False)
