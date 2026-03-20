@@ -1,13 +1,9 @@
 /* =============================================================
-   HYPERBOOKMAP — Dual-Feed Renderer (fixed)
+   HYPERBOOKMAP — Dual-Feed Renderer
 
-   Fixes:
-   1. Chart was invisible: windowHalf only set after WIDE tick detected.
-      Now falls back to MICRO tick immediately so chart renders right away.
-   2. Laggy OB: removed 100ms blend gate. Each feed now pushes its own
-      column immediately. Wide columns carry a 'wide' flag so the renderer
-      uses the correct row height. No more waiting for both feeds.
-   3. Orderbook updates on every micro frame (no throttle).
+   windowHalf = microTickSize * cfg.levels  (MICRO only, never wide)
+   Price axis  = always centered on current midPrice
+   Wide levels = rendered with their own rowH but same price window
    ============================================================= */
 
 window.BookmapPage = (() => {
@@ -28,13 +24,12 @@ window.BookmapPage = (() => {
   let midPrice      = null;
   let microTickSize = null;
   let wideTickSize  = null;
-  let windowHalf    = null;  // set from whichever tick arrives first
+  let windowHalf    = null;  // ALWAYS microTickSize * cfg.levels
 
   const MAX_COLS = 3000;
   const colBuf   = [];  // {mid, bids:[{px,sz,wide}], asks:[{px,sz,wide}]}
   const bubbles  = [];
 
-  // Latest raw levels per feed for orderbook panel
   const latest = {
     micro: { bids: [], asks: [] },
     wide:  { bids: [], asks: [] },
@@ -74,8 +69,8 @@ window.BookmapPage = (() => {
           <div id="bm-overlay">
             Levels: <span id="ov-levels">${cfg.levels}</span><br>
             Coin: <span id="ov-coin">${cfg.coin}</span><br>
-            Micro: <span id="ov-tick-micro">—</span>&nbsp;
-            Wide: <span id="ov-tick-wide">—</span>
+            Range: ±<span id="ov-range">—</span><br>
+            Micro: <span id="ov-tick-micro">—</span> Wide: <span id="ov-tick-wide">—</span>
           </div>
           <div id="bm-waiting">
             <div class="spinner"></div>
@@ -129,29 +124,28 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Window helpers ──────────────────────────────────────────
+  // ── Window: ALWAYS based on micro tick ────────────────────
   function computeWindow() {
-    // Prefer wide tick for range, fall back to micro if wide not yet arrived
-    const tick = wideTickSize || microTickSize;
-    if (!tick) return;
-    windowHalf = tick * cfg.levels;
+    if (!microTickSize) return;          // wait for micro, never use wide
+    windowHalf = microTickSize * cfg.levels;
+    setEl('ov-range', windowHalf.toFixed(windowHalf > 100 ? 0 : 2));
   }
 
-  function py(price, snapMid) {
-    if (!snapMid || !windowHalf) return H / 2;
-    const lo = snapMid - windowHalf;
-    const hi = snapMid + windowHalf;
+  // price → canvas Y, always relative to CURRENT midPrice
+  function py(price) {
+    if (midPrice === null || !windowHalf) return H / 2;
+    const lo = midPrice - windowHalf;
+    const hi = midPrice + windowHalf;
     return H - ((price - lo) / (hi - lo)) * H;
   }
 
-  function rowH(isWide) {
-    if (!windowHalf) return 1;
-    const tick = isWide ? (wideTickSize || microTickSize) : (microTickSize || wideTickSize);
-    if (!tick) return 1;
+  // row height for a given tick size
+  function rowHForTick(tick) {
+    if (!windowHalf || !tick) return 1;
     return Math.max(1, (H / (windowHalf * 2)) * tick);
   }
 
-  // ── Book handler ─────────────────────────────────────────────
+  // ── Book handler ─────────────────────────────────────────
   function onBook(msg) {
     const feed = msg.feed || 'micro';
     const bids = msg.bids || [];
@@ -161,24 +155,24 @@ window.BookmapPage = (() => {
     latest[feed].bids = bids;
     latest[feed].asks = asks;
 
-    // Tick detection
+    // Detect tick size once per feed
     if (bids.length >= 2) {
       const t = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
       if (t > 0) {
         if (feed === 'micro' && !microTickSize) {
           microTickSize = t;
-          setEl('ov-tick-micro', t.toFixed(t < 10 ? 2 : 1));
-          computeWindow(); // compute immediately so chart can render
+          setEl('ov-tick-micro', 'Δ' + t.toFixed(t < 10 ? 2 : 1));
+          computeWindow();   // now we can render
         }
         if (feed === 'wide' && !wideTickSize) {
           wideTickSize = t;
-          setEl('ov-tick-wide', t.toFixed(t < 10 ? 2 : 1));
-          computeWindow(); // recompute with better tick
+          setEl('ov-tick-wide', 'Δ' + t.toFixed(t < 10 ? 2 : 1));
+          // do NOT recompute windowHalf from wide
         }
       }
     }
 
-    // Mid price from micro (most precise)
+    // Mid from micro only
     if (feed === 'micro' && bids.length && asks.length) {
       const bb = parseFloat(bids[0].px);
       const ba = parseFloat(asks[0].px);
@@ -189,26 +183,24 @@ window.BookmapPage = (() => {
       if (se) se.textContent = 'sprd ' + spread.toFixed(spread < 1 ? 4 : 1);
     }
 
-    // Push column immediately (no waiting for both feeds)
+    // Push column — only when we have a valid window
     if (midPrice !== null && windowHalf !== null) {
-      const isWide = feed === 'wide';
-
-      // For wide feed: only include levels OUTSIDE micro range to avoid overlap
+      const isWide     = feed === 'wide';
       const microRange = microTickSize ? microTickSize * 100 : 0;
 
+      const filteredBids = isWide
+        ? bids.filter(b => Math.abs(parseFloat(b.px) - midPrice) > microRange)
+        : bids;
+      const filteredAsks = isWide
+        ? asks.filter(a => Math.abs(parseFloat(a.px) - midPrice) > microRange)
+        : asks;
+
       const snap = {
-        mid:  midPrice,
-        bids: (isWide
-          ? bids.filter(b => Math.abs(parseFloat(b.px) - midPrice) > microRange)
-          : bids
-        ).slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz), wide: isWide })),
-        asks: (isWide
-          ? asks.filter(a => Math.abs(parseFloat(a.px) - midPrice) > microRange)
-          : asks
-        ).slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz), wide: isWide })),
+        mid:  midPrice,   // snapshot mid for historical columns
+        bids: filteredBids.slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz), wide: isWide })),
+        asks: filteredAsks.slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz), wide: isWide })),
       };
 
-      // Only push if there are levels to show
       if (snap.bids.length || snap.asks.length) {
         colBuf.push(snap);
         if (colBuf.length > MAX_COLS) colBuf.shift();
@@ -225,7 +217,7 @@ window.BookmapPage = (() => {
     for (const t of (msg.trades || [])) {
       const price = parseFloat(t.px);
       const size  = parseFloat(t.sz);
-      const y = py(price, midPrice);
+      const y = py(price);
       if (y < 0 || y > H) continue;
       const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(size) * 2));
       bubbles.push({ x: newestX, y, r, side: t.side, alpha: 0.9 });
@@ -234,7 +226,7 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Orderbook panel ──────────────────────────────────────────
+  // ── Orderbook panel ───────────────────────────────────────
   function updateOrderbook() {
     const asksEl = document.getElementById('bm-ob-asks');
     const bidsEl = document.getElementById('bm-ob-bids');
@@ -247,7 +239,7 @@ window.BookmapPage = (() => {
 
     const allSz = [...asks, ...bids].map(x => parseFloat(x.sz));
     const maxSz = Math.max(...allSz, 1);
-    const fmt = p => parseFloat(p).toFixed(midPrice > 100 ? 1 : 4);
+    const fmt   = p => parseFloat(p).toFixed(midPrice > 100 ? 1 : 4);
 
     asksEl.innerHTML = asks.map(a => {
       const sz = parseFloat(a.sz);
@@ -269,13 +261,12 @@ window.BookmapPage = (() => {
     latest.micro.bids = []; latest.micro.asks = [];
     latest.wide.bids  = []; latest.wide.asks  = [];
     setEl('bm-price', '—');
-    setEl('ov-tick-micro', '—');
-    setEl('ov-tick-wide', '—');
-    ['bm-ob-asks','bm-ob-bids'].forEach(id => { const e = document.getElementById(id); if(e) e.innerHTML=''; });
+    setEl('ov-tick-micro', '—'); setEl('ov-tick-wide', '—'); setEl('ov-range', '—');
+    ['bm-ob-asks','bm-ob-bids'].forEach(id => { const e = document.getElementById(id); if (e) e.innerHTML = ''; });
     setEl('bm-ob-mid', '—');
   }
 
-  // ── Render loop ──────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────
   function startLoop() {
     (function loop() { if (dirty) { render(); dirty = false; } requestAnimationFrame(loop); })();
   }
@@ -292,7 +283,7 @@ window.BookmapPage = (() => {
     const visibleCols = Math.floor(newestX / cfg.colWidth) + 1;
     const startIdx    = Math.max(0, numCols - visibleCols);
 
-    // Separate max sizes for fair normalization
+    // Separate normalization per feed
     let maxM = 0, maxW = 0;
     for (let i = startIdx; i < numCols; i++) {
       const s = colBuf[i];
@@ -304,80 +295,80 @@ window.BookmapPage = (() => {
 
     const thrM = contrast * maxM;
     const thrW = contrast * maxW;
+    const rhM  = rowHForTick(microTickSize);
+    const rhW  = rowHForTick(wideTickSize);
 
-    // Grid lines
-    ctx.strokeStyle = 'rgba(30,30,50,0.5)';
-    ctx.lineWidth = 1;
+    // Grid
+    ctx.strokeStyle = 'rgba(30,30,50,0.5)'; ctx.lineWidth = 1;
     for (let i = 0; i <= 10; i++) {
-      const y = Math.round((i/10)*H);
-      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(HEAT_W,y); ctx.stroke();
+      const y = Math.round((i / 10) * H);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(HEAT_W, y); ctx.stroke();
     }
 
-    // Columns
+    // Columns — all prices projected onto CURRENT mid window via py()
     for (let col = 0; col < visibleCols; col++) {
       const si = startIdx + col;
       if (si >= numCols) break;
       const snap = colBuf[si];
-      if (!snap.mid) continue;
       const x = newestX - (numCols - 1 - si) * cfg.colWidth;
       if (x + cfg.colWidth < 0) continue;
 
       for (const b of snap.bids) {
-        const thr = b.wide ? thrW : thrM;
-        const mx  = b.wide ? maxW : maxM;
-        if (b.sz < thr) continue;
-        const rh = rowH(b.wide);
+        if (b.sz < (b.wide ? thrW : thrM)) continue;
+        const mx = b.wide ? maxW : maxM;
+        const rh = b.wide ? rhW  : rhM;
         ctx.fillStyle = bidColor(b.sz / mx);
-        ctx.fillRect(x, py(b.px, snap.mid) - rh*0.5, cfg.colWidth, rh);
+        ctx.fillRect(x, py(b.px) - rh * 0.5, cfg.colWidth, rh);
       }
       for (const a of snap.asks) {
-        const thr = a.wide ? thrW : thrM;
-        const mx  = a.wide ? maxW : maxM;
-        if (a.sz < thr) continue;
-        const rh = rowH(a.wide);
+        if (a.sz < (a.wide ? thrW : thrM)) continue;
+        const mx = a.wide ? maxW : maxM;
+        const rh = a.wide ? rhW  : rhM;
         ctx.fillStyle = askColor(a.sz / mx);
-        ctx.fillRect(x, py(a.px, snap.mid) - rh*0.5, cfg.colWidth, rh);
+        ctx.fillRect(x, py(a.px) - rh * 0.5, cfg.colWidth, rh);
       }
     }
 
     // Mid line
-    const midY = py(midPrice, midPrice);
-    ctx.beginPath(); ctx.strokeStyle='rgba(122,162,247,0.9)'; ctx.lineWidth=1;
-    ctx.setLineDash([4,4]); ctx.moveTo(0,midY); ctx.lineTo(newestX+cfg.colWidth,midY);
+    const midY = py(midPrice);
+    ctx.beginPath(); ctx.strokeStyle = 'rgba(122,162,247,0.9)';
+    ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.moveTo(0, midY); ctx.lineTo(newestX + cfg.colWidth, midY);
     ctx.stroke(); ctx.setLineDash([]);
 
-    // Price axis
+    // Price axis — always based on current mid + windowHalf
     ctx.fillStyle = 'rgba(10,10,20,0.7)';
     ctx.fillRect(HEAT_W, 0, AXIS_W, H);
-    ctx.beginPath(); ctx.strokeStyle='rgba(30,30,50,0.8)'; ctx.lineWidth=1;
-    ctx.moveTo(HEAT_W,0); ctx.lineTo(HEAT_W,H); ctx.stroke();
+    ctx.beginPath(); ctx.strokeStyle = 'rgba(30,30,50,0.8)'; ctx.lineWidth = 1;
+    ctx.moveTo(HEAT_W, 0); ctx.lineTo(HEAT_W, H); ctx.stroke();
 
-    const lo = midPrice - windowHalf;
+    const lo    = midPrice - windowHalf;
     const range = windowHalf * 2;
     ctx.font = '10px Inter, monospace'; ctx.textAlign = 'left';
     for (let i = 0; i <= 12; i++) {
-      const price = lo + (range/12)*i;
-      const y = H - (i/12)*H;
+      const price = lo + (range / 12) * i;
+      const y     = H - (i / 12) * H;
       ctx.fillStyle = 'rgba(108,112,134,0.9)';
-      ctx.fillText(price.toFixed(price>100?1:4), HEAT_W+4, y+3);
+      ctx.fillText(price.toFixed(price > 100 ? 1 : 4), HEAT_W + 4, y + 3);
     }
+    // Current mid highlighted in blue
     ctx.fillStyle = 'rgba(122,162,247,1)'; ctx.font = '11px Inter, monospace';
-    ctx.fillText(midPrice.toFixed(midPrice>100?1:4), HEAT_W+4, midY+4);
+    ctx.fillText(midPrice.toFixed(midPrice > 100 ? 1 : 4), HEAT_W + 4, midY + 4);
 
     // Bubbles
-    for (let i = bubbles.length-1; i >= 0; i--) {
+    for (let i = bubbles.length - 1; i >= 0; i--) {
       const b = bubbles[i];
-      if (b.alpha <= 0) { bubbles.splice(i,1); continue; }
-      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
-      ctx.fillStyle   = b.side==='B' ? `rgba(166,227,161,${b.alpha.toFixed(2)})` : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
-      ctx.strokeStyle = b.side==='B' ? 'rgba(166,227,161,0.9)' : 'rgba(239,83,80,0.9)';
-      ctx.lineWidth=1; ctx.fill(); ctx.stroke();
+      if (b.alpha <= 0) { bubbles.splice(i, 1); continue; }
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fillStyle   = b.side === 'B' ? `rgba(166,227,161,${b.alpha.toFixed(2)})` : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
+      ctx.strokeStyle = b.side === 'B' ? 'rgba(166,227,161,0.9)' : 'rgba(239,83,80,0.9)';
+      ctx.lineWidth = 1; ctx.fill(); ctx.stroke();
       b.alpha -= 0.003;
     }
     if (bubbles.length) dirty = true;
   }
 
-  // ── Public ──────────────────────────────────────────────────
+  // ── Public ────────────────────────────────────────────────
   function onShow() { resize(); dirty = true; }
 
   function onConnected() {
@@ -398,7 +389,7 @@ window.BookmapPage = (() => {
     localStorage.setItem('bm_coin',   cfg.coin);
     localStorage.setItem('bm_levels', cfg.levels);
     localStorage.setItem('bm_speed',  cfg.colWidth);
-    computeWindow();
+    computeWindow();   // recalculate with new cfg.levels
     resetState();
     BackendWS.send({ type: 'set_coin', coin: cfg.coin });
     setEl('bm-coin-badge', cfg.coin + '-PERP');
@@ -407,5 +398,5 @@ window.BookmapPage = (() => {
   }
 
   document.addEventListener('DOMContentLoaded', init);
-  return { onShow, onConnected, onDisconnected, updateCfg, getCfg: () => ({...cfg}) };
+  return { onShow, onConnected, onDisconnected, updateCfg, getCfg: () => ({ ...cfg }) };
 })();
