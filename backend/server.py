@@ -3,6 +3,15 @@ Hyperbookmap Backend
 - Connects to Hyperliquid public WebSocket
 - Bridges l2Book snapshots + trades to the Electron frontend
 - Serves via FastAPI WebSocket on ws://localhost:8765
+
+Depth notes:
+  Hyperliquid l2Book subscription supports `nSigFigs` parameter:
+    nSigFigs=2 -> very aggregated (~5 levels)
+    nSigFigs=3 -> ~20 levels (default if omitted)
+    nSigFigs=4 -> ~50 levels
+    nSigFigs=5 -> maximum raw depth (~100 levels per side)
+  We use nSigFigs=5 for maximum depth.
+  Real tick-level granularity depends on the market.
 """
 
 import asyncio
@@ -20,10 +29,7 @@ log = logging.getLogger("hyperbookmap")
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-# Active frontend clients
 clients: set[WebSocket] = set()
-
-# Shared state
 current_coin: str = "BTC"
 coin_lock = asyncio.Lock()
 
@@ -39,7 +45,6 @@ async def broadcast(msg: dict):
 
 
 async def hl_feed():
-    """Connects to Hyperliquid and forwards l2Book + trades."""
     global current_coin
 
     while True:
@@ -47,16 +52,22 @@ async def hl_feed():
         log.info(f"Connecting to Hyperliquid for coin: {coin}")
         try:
             async with websockets.connect(HL_WS_URL, ping_interval=20) as ws:
+
+                # nSigFigs=5 = maximum depth (~100 levels per side)
                 await ws.send(json.dumps({
                     "method": "subscribe",
-                    "subscription": {"type": "l2Book", "coin": coin}
+                    "subscription": {
+                        "type": "l2Book",
+                        "coin": coin,
+                        "nSigFigs": 5
+                    }
                 }))
                 await ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {"type": "trades", "coin": coin}
                 }))
 
-                log.info(f"Subscribed to l2Book + trades for {coin}")
+                log.info(f"Subscribed l2Book (nSigFigs=5) + trades for {coin}")
 
                 while True:
                     if current_coin != coin:
@@ -76,6 +87,7 @@ async def hl_feed():
                         levels = book_data.get("levels", [[], []])
                         bids = levels[0] if len(levels) > 0 else []
                         asks = levels[1] if len(levels) > 1 else []
+                        log.debug(f"l2Book: {len(bids)} bids, {len(asks)} asks")
 
                         await broadcast({
                             "type": "l2Book",
