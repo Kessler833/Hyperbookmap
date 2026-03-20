@@ -1,15 +1,5 @@
 /* =============================================================
-   HYPERBOOKMAP — Proper Bookmap renderer
-
-   HOW IT WORKS (like real Bookmap):
-   - Every l2Book snapshot = one vertical column on canvas
-   - Y-axis = price, centered around mid price
-   - The visible price window is fixed height around mid (e.g. ±N ticks)
-   - Every price level in that window gets a colored pixel/rect
-   - Brightness = order size at that level
-   - Columns scroll left, newest always on right
-   - 85% scroll: newest column drawn at x=85% of canvas width,
-     leaving 15% empty space on the right
+   HYPERBOOKMAP — Canvas renderer + Live Orderbook panel
    ============================================================= */
 
 window.BookmapPage = (() => {
@@ -17,47 +7,41 @@ window.BookmapPage = (() => {
     coin:      localStorage.getItem('bm_coin')            || 'BTC',
     levels:    parseInt(localStorage.getItem('bm_levels') || '80'),
     colWidth:  parseInt(localStorage.getItem('bm_speed')  || '4'),
+    nSigFigs:  parseInt(localStorage.getItem('bm_nsigfigs') || '4'),
     maxBubble: 20,
   };
 
-  // contrast: 0..1 — fraction of maxSz below which levels are hidden
   let contrast = parseFloat(localStorage.getItem('bm_contrast') || '0.05');
 
   let canvas, ctx, wrap;
   let W = 0, H = 0;
   let dirty = false;
 
-  let midPrice    = null;
-  let tickSize    = null;
+  let midPrice   = null;
+  let tickSize   = null;
+  let windowHalf = null;
 
-  // Fixed-height price window centered on mid (in price units)
-  // Derived once tickSize is known: windowHalf = levels * tickSize
-  let windowHalf  = null;  // half the visible price range
+  const MAX_COLS = 3000;
+  const colBuf   = [];
+  const bubbles  = [];
+  let latestBids = [];
+  let latestAsks = [];
 
-  const MAX_COLS  = 3000;
-  const colBuf    = [];   // [{bids:[{px,sz}], asks:[{px,sz}], mid}]
-  const bubbles   = [];
-
-  let latestBids  = [];
-  let latestAsks  = [];
-
-  // ── Colors ─────────────────────────────────────────────
+  // ── Colors ───────────────────────────────────────────────────
   function bidColor(norm) {
-    // black → bright cyan/blue
     const r = Math.round(norm * 40);
     const g = Math.round(norm * 200);
     const b = Math.round(60 + norm * 150);
     return `rgba(${r},${g},${b},${(0.1 + norm * 0.9).toFixed(2)})`;
   }
   function askColor(norm) {
-    // black → bright red/orange
     const r = Math.round(60 + norm * 195);
     const g = Math.round(norm * 80);
     const b = Math.round(norm * 20);
     return `rgba(${r},${g},${b},${(0.1 + norm * 0.9).toFixed(2)})`;
   }
 
-  // ── DOM init ──────────────────────────────────────────
+  // ── DOM init ──────────────────────────────────────────────────
   function init() {
     const page = document.getElementById('page-bookmap');
     page.innerHTML = `
@@ -83,7 +67,8 @@ window.BookmapPage = (() => {
           <div id="bm-overlay">
             Levels: <span id="ov-levels">${cfg.levels}</span><br>
             Coin: <span id="ov-coin">${cfg.coin}</span><br>
-            Tick: <span id="ov-tick">—</span>
+            Tick: <span id="ov-tick">—</span><br>
+            Mode: <span id="ov-mode">nSigFigs=${cfg.nSigFigs}</span>
           </div>
           <div id="bm-waiting">
             <div class="spinner"></div>
@@ -93,9 +78,7 @@ window.BookmapPage = (() => {
         </div>
 
         <div id="bm-ob">
-          <div id="bm-ob-header">
-            <span>Price</span><span>Size</span>
-          </div>
+          <div id="bm-ob-header"><span>Price</span><span>Size</span></div>
           <div id="bm-ob-body">
             <div id="bm-ob-asks"></div>
             <div id="bm-ob-mid">—</div>
@@ -125,6 +108,7 @@ window.BookmapPage = (() => {
     BackendWS.on('coin_changed', msg => {
       setEl('bm-coin-badge', msg.coin + '-PERP');
       setEl('ov-coin', msg.coin);
+      setEl('ov-mode', `nSigFigs=${msg.nSigFigs || cfg.nSigFigs}`);
       resetState();
     });
   }
@@ -143,24 +127,19 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Price window helpers ───────────────────────────────────
-  // The visible price window: [mid - windowHalf, mid + windowHalf]
-  // windowHalf is recalculated whenever tickSize or cfg.levels changes
+  // ── Price window ──────────────────────────────────────────────
   function computeWindow() {
     if (tickSize === null) return;
     windowHalf = tickSize * cfg.levels;
   }
 
-  // Convert price to Y pixel using the CURRENT mid as center
   function priceToY(price) {
     if (midPrice === null || windowHalf === null || windowHalf === 0) return H / 2;
     const lo = midPrice - windowHalf;
     const hi = midPrice + windowHalf;
-    // price==hi → y=0 (top), price==lo → y=H (bottom)
     return H - ((price - lo) / (hi - lo)) * H;
   }
 
-  // The Y coordinate a stored snapshot column used (it had its own mid)
   function priceToYWithMid(price, snapMid) {
     if (snapMid === null || windowHalf === null || windowHalf === 0) return H / 2;
     const lo = snapMid - windowHalf;
@@ -168,13 +147,12 @@ window.BookmapPage = (() => {
     return H - ((price - lo) / (hi - lo)) * H;
   }
 
-  // How tall is one tick in pixels?
   function tickPx() {
     if (tickSize === null || windowHalf === null) return cfg.colWidth;
     return Math.max(1, (H / (windowHalf * 2)) * tickSize);
   }
 
-  // ── Data handlers ───────────────────────────────────────
+  // ── Data handlers ─────────────────────────────────────────────
   function onBook(msg) {
     const bids = msg.bids || [];
     const asks = msg.asks || [];
@@ -183,13 +161,12 @@ window.BookmapPage = (() => {
     latestBids = bids;
     latestAsks = asks;
 
-    // Derive tick size from first snapshot
     if (tickSize === null && bids.length >= 2) {
-      tickSize = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
-      if (tickSize === 0) tickSize = null; // guard
-      else {
+      const t = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
+      if (t > 0) {
+        tickSize = t;
         computeWindow();
-        setEl('ov-tick', tickSize.toFixed(tickSize < 1 ? 4 : 1));
+        setEl('ov-tick', t.toFixed(t < 1 ? 4 : t < 10 ? 2 : 1));
       }
     }
 
@@ -203,13 +180,11 @@ window.BookmapPage = (() => {
       if (spreadEl) spreadEl.textContent = 'sprd ' + spread.toFixed(spread < 1 ? 4 : 1);
     }
 
-    // Store full snapshot with its mid
-    const snap = {
+    colBuf.push({
       mid:  midPrice,
       bids: bids.slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz) })),
       asks: asks.slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz) })),
-    };
-    colBuf.push(snap);
+    });
     if (colBuf.length > MAX_COLS) colBuf.shift();
 
     updateOrderbook();
@@ -219,8 +194,7 @@ window.BookmapPage = (() => {
   function onTrades(msg) {
     const trades = msg.trades || [];
     if (!W || !H || midPrice === null) return;
-    // 85% anchor: newest trades appear at 85% of width
-    const newestX = Math.floor(W * 0.85);
+    const newestX = Math.floor((W - 58) * 0.85);
     trades.forEach(t => {
       const price = parseFloat(t.px);
       const size  = parseFloat(t.sz);
@@ -228,12 +202,12 @@ window.BookmapPage = (() => {
       if (y < 0 || y > H) return;
       const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(size) * 2));
       bubbles.push({ x: newestX, y, r, side: t.side, alpha: 0.9 });
-      if (bubbles.length > 600) bubbles.splice(0, bubbles.length - 600);
+      if (bubbles.length > 600) bubbles.splice(0, 600);
     });
     dirty = true;
   }
 
-  // ── Orderbook panel ────────────────────────────────────────
+  // ── Orderbook panel ───────────────────────────────────────────
   function updateOrderbook() {
     const asksEl = document.getElementById('bm-ob-asks');
     const bidsEl = document.getElementById('bm-ob-bids');
@@ -245,19 +219,16 @@ window.BookmapPage = (() => {
     const bids = latestBids.slice(0, ROWS);
     const allSz = [...asks.map(a => parseFloat(a.sz)), ...bids.map(b => parseFloat(b.sz))];
     const maxSz = allSz.length ? Math.max(...allSz) : 1;
-
     const fmt = p => parseFloat(p).toFixed(midPrice > 100 ? 1 : 4);
 
     asksEl.innerHTML = asks.map(a => {
-      const sz  = parseFloat(a.sz);
-      const pct = Math.round((sz / maxSz) * 100);
-      return `<div class="ob-row ask"><div class="ob-bar" style="width:${pct}%"></div><span class="ob-px">${fmt(a.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
+      const sz = parseFloat(a.sz);
+      return `<div class="ob-row ask"><div class="ob-bar" style="width:${Math.round(sz/maxSz*100)}%"></div><span class="ob-px">${fmt(a.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
     }).join('');
 
     bidsEl.innerHTML = bids.map(b => {
-      const sz  = parseFloat(b.sz);
-      const pct = Math.round((sz / maxSz) * 100);
-      return `<div class="ob-row bid"><div class="ob-bar" style="width:${pct}%"></div><span class="ob-px">${fmt(b.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
+      const sz = parseFloat(b.sz);
+      return `<div class="ob-row bid"><div class="ob-bar" style="width:${Math.round(sz/maxSz*100)}%"></div><span class="ob-px">${fmt(b.px)}</span><span class="ob-sz">${sz.toFixed(3)}</span></div>`;
     }).join('');
 
     if (midEl && midPrice !== null)
@@ -265,21 +236,18 @@ window.BookmapPage = (() => {
   }
 
   function resetState() {
-    colBuf.length = 0;
-    bubbles.length = 0;
+    colBuf.length = 0; bubbles.length = 0;
     midPrice = null; tickSize = null; windowHalf = null;
     latestBids = []; latestAsks = [];
-    setEl('bm-price', '—');
-    setEl('ov-tick',  '—');
-    const asksEl = document.getElementById('bm-ob-asks');
-    const bidsEl = document.getElementById('bm-ob-bids');
-    const midEl  = document.getElementById('bm-ob-mid');
-    if (asksEl) asksEl.innerHTML = '';
-    if (bidsEl) bidsEl.innerHTML = '';
-    if (midEl)  midEl.textContent = '—';
+    setEl('bm-price', '—'); setEl('ov-tick', '—');
+    ['bm-ob-asks','bm-ob-bids'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '';
+    });
+    setEl('bm-ob-mid', '—');
   }
 
-  // ── Render loop ─────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────
   function startLoop() {
     (function loop() {
       if (dirty) { render(); dirty = false; }
@@ -290,25 +258,18 @@ window.BookmapPage = (() => {
   function render() {
     if (!ctx || !W || !H) return;
     ctx.clearRect(0, 0, W, H);
-
     if (colBuf.length === 0 || windowHalf === null || midPrice === null) return;
 
-    // ── Layout constants ────────────────────────────────────
-    const AXIS_W     = 58;          // px reserved for price axis on right
-    const HEAT_W     = W - AXIS_W;  // canvas width for heatmap columns
-    const ANCHOR     = 0.85;        // newest column at 85% of HEAT_W
+    const AXIS_W     = 58;
+    const HEAT_W     = W - AXIS_W;
+    const ANCHOR     = 0.85;
     const newestX    = Math.floor(HEAT_W * ANCHOR);
     const numCols    = colBuf.length;
-
-    // How many columns fit from 0 to newestX?
     const visibleCols = Math.floor(newestX / cfg.colWidth) + 1;
-    const startIdx    = Math.max(0, numCols - visibleCols);
+    const startIdx   = Math.max(0, numCols - visibleCols);
+    const rowH       = Math.max(1, tickPx());
 
-    // Pixel height of one tick
-    const tPx = tickPx();
-    const rowH = Math.max(1, tPx);
-
-    // ── Global normalize: max order size across visible window ──
+    // Global max size for normalization
     let maxSz = 0;
     for (let i = startIdx; i < numCols; i++) {
       const s = colBuf[i];
@@ -319,118 +280,90 @@ window.BookmapPage = (() => {
 
     const threshold = contrast * maxSz;
 
-    // ── Draw grid lines ────────────────────────────────────
+    // Grid lines
     ctx.strokeStyle = 'rgba(30,30,50,0.5)';
-    ctx.lineWidth   = 1;
-    const gridSteps = 10;
-    for (let i = 0; i <= gridSteps; i++) {
-      const y = Math.round((i / gridSteps) * H);
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(HEAT_W, y);
-      ctx.stroke();
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 10; i++) {
+      const y = Math.round((i / 10) * H);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(HEAT_W, y); ctx.stroke();
     }
 
-    // ── Draw heatmap columns ───────────────────────────────
-    // Each stored snapshot is rendered as one vertical column.
-    // X position: newest at newestX, older columns to the left.
-    // Y position: computed from that snapshot's own mid price
-    //             so the price ladder is stable relative to mid.
-
+    // Heatmap columns
     for (let col = 0; col < visibleCols; col++) {
       const snapIdx = startIdx + col;
       if (snapIdx >= numCols) break;
       const snap = colBuf[snapIdx];
-      const snapMid = snap.mid;
-      if (snapMid === null) continue;
-
-      // x of this column (older = further left)
+      if (!snap.mid) continue;
       const colsFromNewest = (numCols - 1) - snapIdx;
       const x = newestX - colsFromNewest * cfg.colWidth;
-      if (x + cfg.colWidth < 0) continue; // off-screen left
+      if (x + cfg.colWidth < 0) continue;
 
       for (const b of snap.bids) {
         if (b.sz < threshold) continue;
-        const norm = b.sz / maxSz;
-        const y    = priceToYWithMid(b.px, snapMid);
-        ctx.fillStyle = bidColor(norm);
-        ctx.fillRect(x, y - rowH * 0.5, cfg.colWidth, rowH);
+        ctx.fillStyle = bidColor(b.sz / maxSz);
+        ctx.fillRect(x, priceToYWithMid(b.px, snap.mid) - rowH * 0.5, cfg.colWidth, rowH);
       }
-
       for (const a of snap.asks) {
         if (a.sz < threshold) continue;
-        const norm = a.sz / maxSz;
-        const y    = priceToYWithMid(a.px, snapMid);
-        ctx.fillStyle = askColor(norm);
-        ctx.fillRect(x, y - rowH * 0.5, cfg.colWidth, rowH);
+        ctx.fillStyle = askColor(a.sz / maxSz);
+        ctx.fillRect(x, priceToYWithMid(a.px, snap.mid) - rowH * 0.5, cfg.colWidth, rowH);
       }
     }
 
-    // ── Mid price line (at current mid, drawn at newestX anchor) ──
+    // Mid line
     const midY = priceToY(midPrice);
     ctx.beginPath();
     ctx.strokeStyle = 'rgba(122,162,247,0.9)';
-    ctx.lineWidth   = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.moveTo(0, midY);
-    ctx.lineTo(newestX + cfg.colWidth, midY);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.moveTo(0, midY); ctx.lineTo(newestX + cfg.colWidth, midY);
+    ctx.stroke(); ctx.setLineDash([]);
 
-    // ── Price axis (right of heatmap) ────────────────────────
-    ctx.fillStyle   = 'rgba(10,10,20,0.7)';
+    // Price axis
+    ctx.fillStyle = 'rgba(10,10,20,0.7)';
     ctx.fillRect(HEAT_W, 0, AXIS_W, H);
     ctx.strokeStyle = 'rgba(30,30,50,0.8)';
-    ctx.lineWidth   = 1;
-    ctx.beginPath();
-    ctx.moveTo(HEAT_W, 0);
-    ctx.lineTo(HEAT_W, H);
-    ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(HEAT_W, 0); ctx.lineTo(HEAT_W, H); ctx.stroke();
 
-    ctx.font      = '10px Inter, monospace';
+    const lo = midPrice - windowHalf;
+    const range = windowHalf * 2;
+    ctx.font = '10px Inter, monospace';
     ctx.fillStyle = 'rgba(108,112,134,0.9)';
     ctx.textAlign = 'left';
-    const lo = midPrice - windowHalf;
-    const hi = midPrice + windowHalf;
-    const range = hi - lo;
-    const steps = 12;
-    for (let i = 0; i <= steps; i++) {
-      const price = lo + (range / steps) * i;
-      const y     = H - (i / steps) * H;
+    for (let i = 0; i <= 12; i++) {
+      const price = lo + (range / 12) * i;
+      const y = H - (i / 12) * H;
+      ctx.fillStyle = 'rgba(108,112,134,0.9)';
       ctx.fillText(price.toFixed(price > 100 ? 1 : 4), HEAT_W + 4, y + 3);
     }
-
-    // Highlight mid price label
+    // Mid label highlighted
     ctx.fillStyle = 'rgba(122,162,247,1)';
-    ctx.font      = '11px Inter, monospace';
+    ctx.font = '11px Inter, monospace';
     ctx.fillText(midPrice.toFixed(midPrice > 100 ? 1 : 4), HEAT_W + 4, midY + 4);
 
-    // ── Trade bubbles ────────────────────────────────────────
+    // Bubbles
     for (let i = bubbles.length - 1; i >= 0; i--) {
       const b = bubbles[i];
       if (b.alpha <= 0) { bubbles.splice(i, 1); continue; }
       ctx.beginPath();
       ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
-      ctx.fillStyle   = b.side === 'B'
-        ? `rgba(166,227,161,${b.alpha.toFixed(2)})`
-        : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
+      ctx.fillStyle   = b.side === 'B' ? `rgba(166,227,161,${b.alpha.toFixed(2)})` : `rgba(239,83,80,${b.alpha.toFixed(2)})`;
       ctx.strokeStyle = b.side === 'B' ? 'rgba(166,227,161,0.9)' : 'rgba(239,83,80,0.9)';
-      ctx.lineWidth   = 1;
-      ctx.fill();
-      ctx.stroke();
+      ctx.lineWidth = 1;
+      ctx.fill(); ctx.stroke();
       b.alpha -= 0.003;
     }
     if (bubbles.length > 0) dirty = true;
   }
 
-  // ── Public API ───────────────────────────────────────────
+  // ── Public API ────────────────────────────────────────────────
   function onShow() { resize(); dirty = true; }
 
   function onConnected() {
     document.getElementById('bm-dot')?.classList.add('live');
     setEl('bm-status-text', 'Live');
     document.getElementById('bm-waiting')?.classList.add('hidden');
-    BackendWS.send({ type: 'set_coin', coin: cfg.coin });
+    BackendWS.send({ type: 'set_coin', coin: cfg.coin, nSigFigs: cfg.nSigFigs });
   }
 
   function onDisconnected() {
@@ -441,16 +374,17 @@ window.BookmapPage = (() => {
 
   function updateCfg(newCfg) {
     Object.assign(cfg, newCfg);
-    localStorage.setItem('bm_coin',   cfg.coin);
-    localStorage.setItem('bm_levels', cfg.levels);
-    localStorage.setItem('bm_speed',  cfg.colWidth);
-    // Recompute window if levels changed
+    localStorage.setItem('bm_coin',     cfg.coin);
+    localStorage.setItem('bm_levels',   cfg.levels);
+    localStorage.setItem('bm_speed',    cfg.colWidth);
+    localStorage.setItem('bm_nsigfigs', cfg.nSigFigs);
     computeWindow();
     resetState();
-    BackendWS.send({ type: 'set_coin', coin: cfg.coin });
+    BackendWS.send({ type: 'set_coin', coin: cfg.coin, nSigFigs: cfg.nSigFigs });
     setEl('bm-coin-badge', cfg.coin + '-PERP');
     setEl('ov-coin',   cfg.coin);
     setEl('ov-levels', cfg.levels);
+    setEl('ov-mode',   `nSigFigs=${cfg.nSigFigs}`);
   }
 
   document.addEventListener('DOMContentLoaded', init);
