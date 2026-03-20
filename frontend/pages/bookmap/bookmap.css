@@ -1,0 +1,101 @@
+/* ── BOOKMAP PAGE ──────────────────────────────────────────── */
+#page-bookmap {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+}
+#page-bookmap.active { display: flex; }
+
+#bm-header {
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 14px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+#bm-coin-badge {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+#bm-price {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+
+#bm-status {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  transition: background 0.3s;
+}
+.status-dot.live { background: var(--green); animation: pulse 2s infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+#bm-canvas-wrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#bm-canvas {
+  display: block;
+  position: absolute;
+  top: 0; left: 0;
+}
+
+#bm-overlay {
+  position: absolute;
+  top: 10px; right: 10px;
+  background: rgba(10,10,20,0.82);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 10px;
+  color: var(--muted);
+  pointer-events: none;
+  line-height: 1.7;
+  z-index: 10;
+}
+#bm-overlay span { color: var(--text); font-weight: 600; }
+
+#bm-waiting {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--faint);
+  font-size: 13px;
+  z-index: 20;
+  background: var(--bg);
+}
+#bm-waiting.hidden { display: none; }

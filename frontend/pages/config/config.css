@@ -1,0 +1,81 @@
+#page-config {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+}
+#page-config.active { display: flex; }
+
+#config-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  max-width: 540px;
+}
+
+.cfg-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.cfg-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.cfg-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.cfg-hint {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: -4px;
+}
+
+.cfg-input {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.cfg-input:focus { border-color: var(--accent); }
+
+.cfg-select {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  width: 100%;
+  outline: none;
+  cursor: pointer;
+}
+
+#cfg-save-btn { align-self: flex-start; margin-top: 4px; }
+
+#cfg-saved-msg {
+  font-size: 11px;
+  color: var(--green);
+  display: none;
+  align-items: center;
+  gap: 6px;
+}
+#cfg-saved-msg.show { display: flex; }

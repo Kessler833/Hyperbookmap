@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hyperbookmap</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./core/base.css">
+  <link rel="stylesheet" href="./core/components.css">
+  <link rel="stylesheet" href="./pages/bookmap/bookmap.css">
+  <link rel="stylesheet" href="./pages/config/config.css">
+</head>
+<body>
+
+  <nav id="sidebar">
+    <div id="logo">
+      <svg class="logo-icon" width="20" height="20" viewBox="0 0 24 24" fill="none">
+        <rect x="2" y="2" width="9" height="9" rx="1" fill="#7aa2f7" opacity="0.9"/>
+        <rect x="13" y="2" width="9" height="9" rx="1" fill="#7aa2f7" opacity="0.5"/>
+        <rect x="2" y="13" width="9" height="9" rx="1" fill="#ef5350" opacity="0.5"/>
+        <rect x="13" y="13" width="9" height="9" rx="1" fill="#a6e3a1" opacity="0.5"/>
+      </svg>
+      <span class="logo-text">Hyperbookmap</span>
+    </div>
+    <ul id="nav-links">
+      <li class="nav-item active" data-page="bookmap">
+        <span class="nav-icon">🌡️</span><span class="nav-label">Bookmap</span>
+      </li>
+      <li class="nav-item" data-page="config">
+        <span class="nav-icon">⚙️</span><span class="nav-label">Config</span>
+      </li>
+    </ul>
+    <button id="sidebar-toggle" title="Collapse">◄</button>
+  </nav>
+
+  <main id="main-content">
+    <div id="page-bookmap" class="page active"></div>
+    <div id="page-config" class="page"></div>
+  </main>
+
+  <script src="./core/app.js"></script>
+  <script src="./pages/bookmap/bookmap.js"></script>
+  <script src="./pages/config/config.js"></script>
+</body>
+</html>
