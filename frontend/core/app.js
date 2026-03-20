@@ -1,4 +1,4 @@
-// ─ Router ─────────────────────────────────────────────────────────────
+// ── Router ─────────────────────────────────────────────────────
 const pages = ['bookmap', 'bot'];
 
 function showPage(name) {
@@ -18,23 +18,37 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
   document.getElementById('sidebar').classList.toggle('collapsed');
 });
 
-// ─ WebSocket ────────────────────────────────────────────────────────────
+// ── WebSocket with send queue ───────────────────────────────────
 const WS_URL = 'ws://127.0.0.1:8765/ws';
-let _ws = null;
+let _ws             = null;
 let _reconnectTimer = null;
+let _sendQueue      = [];        // queued while not yet OPEN
 
 window.BackendWS = {
   handlers: {},
-  on(type, fn)  { this.handlers[type] = fn; },
+  on(type, fn) { this.handlers[type] = fn; },
   send(obj) {
-    if (_ws && _ws.readyState === WebSocket.OPEN)
+    if (_ws && _ws.readyState === WebSocket.OPEN) {
       _ws.send(JSON.stringify(obj));
+    } else {
+      // queue — flushed on open
+      _sendQueue.push(obj);
+    }
   }
 };
 
 function connectBackend() {
   _ws = new WebSocket(WS_URL);
-  _ws.onopen    = () => { if (window.BookmapPage) BookmapPage.onConnected(); };
+
+  _ws.onopen = () => {
+    console.log('[WS] connected');
+    // flush queue
+    while (_sendQueue.length) {
+      _ws.send(JSON.stringify(_sendQueue.shift()));
+    }
+    if (window.BookmapPage) BookmapPage.onConnected();
+  };
+
   _ws.onmessage = (evt) => {
     try {
       const msg = JSON.parse(evt.data);
@@ -42,12 +56,15 @@ function connectBackend() {
       if (h) h(msg);
     } catch(e) { /* ignore */ }
   };
-  _ws.onclose   = () => {
+
+  _ws.onclose = () => {
+    console.warn('[WS] disconnected, retry in 2s');
     if (window.BookmapPage) BookmapPage.onDisconnected();
     clearTimeout(_reconnectTimer);
     _reconnectTimer = setTimeout(connectBackend, 2000);
   };
-  _ws.onerror   = () => _ws.close();
+
+  _ws.onerror = () => _ws.close();
 }
 
 document.addEventListener('DOMContentLoaded', () => {

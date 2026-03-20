@@ -3,6 +3,7 @@
 
 :root {
   --bg:          #0a0a14;
+  --bg2:         #0d0d1e;   /* alias for --surface2 */
   --surface:     #1a1a2e;
   --surface2:    #0d0d1e;
   --border:      #1e1e30;
@@ -46,8 +47,8 @@ input, select, textarea { font-family: inherit; }
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  min-width: 0;       /* CRITICAL: prevents flex child from overflowing */
-  width: 0;           /* forces flex to calculate width correctly */
+  min-width: 0;
+  width: 0;
 }
 
 .page {
