@@ -1,38 +1,52 @@
 /* =============================================================
-   HYPERBOOKMAP — Bookmap page
+   HYPERBOOKMAP — Bookmap
 
-   Price axis drag → zoom:
-     drag UP   = zoom in  (narrow price range)
-     drag DOWN = zoom out (widen price range)
-   Default zoom = fit all live orderbook levels.
-
-   -webkit-app-region:no-drag on axis strip prevents the
-   Electron window-drag bug from interfering with mouse events.
+   Features:
+   - Threshold contrast: slider sets min order size to show.
+     Orders above threshold get full colour, below = invisible.
+     No single giant order dims the rest.
+   - Live area: red top (asks) / green bottom (bids) — same as before
+   - Historical area (left of newest-x): desaturated hue-shifted
+     colours so history is visually distinct from live
+   - Delta column: rightmost column shows bid−ask size delta per
+     price level as cyan (bid>ask) or magenta (ask>bid) bars
+   - Y-axis drag: drag UP=zoom in, DOWN=zoom out on price range
+   - X-axis scroll (mouse wheel in chart area): scroll UP=zoom in
+     (fewer columns), scroll DOWN=zoom out (more columns)
+   - Timestamps on bottom of chart
+   - Auto-fit default: windowHalf fits all live OB levels
    ============================================================= */
 
 window.BookmapPage = (() => {
 
+  // ─ Config ──────────────────────────────────────────────────
   let cfg = {
-    coin:     localStorage.getItem('bm_coin')  || 'BTC',
-    levels:   500,
-    colWidth: parseInt(localStorage.getItem('bm_speed') || '4'),
+    coin:      localStorage.getItem('bm_coin')  || 'BTC',
+    levels:    500,
+    colWidth:  parseInt(localStorage.getItem('bm_speed') || '4'),
     maxBubble: 20,
   };
 
-  let contrast = parseFloat(localStorage.getItem('bm_contrast') || '0.05');
+  // Contrast = absolute size threshold (not relative to max)
+  // Stored as fraction of a reference; default 0 = show all
+  // UI slider maps 0–100 → 0–maxSz*0.5 dynamically
+  let contrastFrac = parseFloat(localStorage.getItem('bm_contrast') || '0.05');
 
-  // Zoom state
-  // windowHalf is computed dynamically from the live book depth
-  // until the user overrides it by dragging the axis
-  let windowHalf    = null;   // null = auto-fit
-  let windowHalfAuto = null;  // last auto value
-  let userZoom      = false;  // true after first drag
-  let tickSize      = null;
+  // ─ Zoom state ───────────────────────────────────────────────
+  let windowHalf     = null;  // Y-zoom: price range half
+  let windowHalfAuto = null;
+  let userZoomY      = false;
+  let tickSize       = null;
 
-  // Drag state
-  let axisDragging  = false;
-  let axisDragStartY = 0;
-  let axisDragStartHalf = 0;
+  // X-zoom: colWidth multiplier (1 = cfg.colWidth, >1 = zoomed out)
+  // Wheel UP → xZoom decreases (fewer px per col = zoom IN on time)
+  // Wheel DOWN → xZoom increases (more px per col = zoom OUT on time)
+  let xZoomMul = 1.0;   // multiplied with cfg.colWidth
+
+  // Axis drag
+  let axisDragging    = false;
+  let axisDragStartY  = 0;
+  let axisDragStartH  = 0;
 
   let canvas, ctx, wrap;
   let W = 0, H = 0;
@@ -47,16 +61,31 @@ window.BookmapPage = (() => {
     spread: 0, sigma: 0,
   };
 
-  const MAX_COLS = 3000;
-  const colBuf   = [];
+  const MAX_COLS = 6000;
+  const colBuf   = [];   // { mid, bids:[{px,sz}], asks:[{px,sz}], ts }
   const bubbles  = [];
   const latest   = { bids: [], asks: [] };
 
-  // ── Colors ────────────────────────────────────────────────────
-  const bidColor = n => `rgba(${Math.round(n*40)},${Math.round(n*200)},${Math.round(60+n*150)},${(0.1+n*0.9).toFixed(2)})`;
-  const askColor = n => `rgba(${Math.round(60+n*195)},${Math.round(n*80)},${Math.round(n*20)},${(0.1+n*0.9).toFixed(2)})`;
+  const TS_BAR_H = 18;   // px reserved for timestamp bar at bottom
 
-  // ── DOM init ──────────────────────────────────────────────────
+  // ─ Colour helpers ──────────────────────────────────────────────
+  // LIVE colours (bright, saturated)
+  //   bids (below mid) → green
+  //   asks (above mid) → red
+  const liveBidColor = n => `rgba(${Math.round(n*40)},${Math.round(100+n*155)},${Math.round(60+n*80)},${(0.15+n*0.85).toFixed(2)})`;
+  const liveAskColor = n => `rgba(${Math.round(120+n*135)},${Math.round(n*60)},${Math.round(n*20)},${(0.15+n*0.85).toFixed(2)})`;
+
+  // HISTORICAL colours (muted, shifted hue so clearly distinct)
+  //   hist bids → teal-ish blue-green
+  //   hist asks → orange-magenta
+  const histBidColor = n => `rgba(${Math.round(20+n*40)},${Math.round(80+n*100)},${Math.round(80+n*120)},${(0.12+n*0.6).toFixed(2)})`;
+  const histAskColor = n => `rgba(${Math.round(100+n*100)},${Math.round(40+n*60)},${Math.round(60+n*80)},${(0.12+n*0.6).toFixed(2)})`;
+
+  // DELTA colours
+  const deltaBidCol = a => `rgba(0,200,200,${a.toFixed(2)})`;
+  const deltaAskCol = a => `rgba(200,0,200,${a.toFixed(2)})`;
+
+  // ─ DOM ────────────────────────────────────────────────────────
   function init() {
     const page = document.getElementById('page-bookmap');
     page.innerHTML = `
@@ -66,7 +95,6 @@ window.BookmapPage = (() => {
         <span id="bm-price">—</span>
         <span id="bm-spread"></span>
 
-        <!-- Coin changer -->
         <div class="bm-ctl-group">
           <label>Coin</label>
           <input id="bm-coin-input" class="bm-input" type="text"
@@ -75,15 +103,13 @@ window.BookmapPage = (() => {
           <button id="bm-coin-go" class="bm-btn">Go</button>
         </div>
 
-        <!-- Contrast -->
-        <div class="bm-ctl-group">
-          <label>Contrast</label>
-          <input id="bm-contrast" type="range" min="0" max="0.5" step="0.01"
-            value="${contrast}" style="width:70px;accent-color:var(--accent)">
-          <span id="bm-contrast-val" style="color:var(--text);min-width:28px">${Math.round(contrast*100)}%</span>
+        <div class="bm-ctl-group" title="Threshold: orders below this size are hidden. Prevents one huge order from dimming everything.">
+          <label>Threshold</label>
+          <input id="bm-contrast" type="range" min="0" max="0.5" step="0.005"
+            value="${contrastFrac}" style="width:70px;accent-color:var(--accent)">
+          <span id="bm-contrast-val" style="color:var(--text);min-width:28px">${Math.round(contrastFrac*100)}%</span>
         </div>
 
-        <!-- Speed -->
         <div class="bm-ctl-group">
           <label>Speed</label>
           <select id="bm-speed" class="bm-select">
@@ -106,11 +132,9 @@ window.BookmapPage = (() => {
         <div id="bm-canvas-wrap">
           <canvas id="bm-canvas"></canvas>
 
-          <!-- Price-axis drag strip (top of canvas, right side) -->
           <div id="bm-axis-drag"></div>
           <div id="bm-zoom-hint">↕ drag<br>to zoom</div>
 
-          <!-- Bot stats overlay -->
           <div id="bm-bot-overlay" class="hidden">
             <div class="bov-row"><span class="bov-l">PnL</span>   <span class="bov-v" id="bov-pnl">—</span></div>
             <div class="bov-row"><span class="bov-l">Inv</span>    <span class="bov-v" id="bov-inv">—</span></div>
@@ -149,16 +173,15 @@ window.BookmapPage = (() => {
     resize();
     startLoop();
     bindAxisDrag();
+    bindScrollZoom();
 
-    // Contrast
     document.getElementById('bm-contrast').addEventListener('input', e => {
-      contrast = parseFloat(e.target.value);
-      localStorage.setItem('bm_contrast', contrast);
-      document.getElementById('bm-contrast-val').textContent = Math.round(contrast*100) + '%';
+      contrastFrac = parseFloat(e.target.value);
+      localStorage.setItem('bm_contrast', contrastFrac);
+      document.getElementById('bm-contrast-val').textContent = Math.round(contrastFrac * 100) + '%';
       dirty = true;
     });
 
-    // Coin change
     const coinIn = document.getElementById('bm-coin-input');
     const goBtn  = document.getElementById('bm-coin-go');
     coinIn.addEventListener('input', e => { e.target.value = e.target.value.toUpperCase(); });
@@ -173,10 +196,10 @@ window.BookmapPage = (() => {
     goBtn.addEventListener('click', applyCoin);
     coinIn.addEventListener('keydown', e => { if (e.key === 'Enter') applyCoin(); });
 
-    // Speed
     document.getElementById('bm-speed').addEventListener('change', e => {
       cfg.colWidth = parseInt(e.target.value);
       localStorage.setItem('bm_speed', cfg.colWidth);
+      dirty = true;
     });
 
     BackendWS.on('l2Book',       onBook);
@@ -188,52 +211,50 @@ window.BookmapPage = (() => {
     });
   }
 
-  // ── Price axis drag → zoom ────────────────────────────────────
-  //   Drag UP   = reduce windowHalf = zoom IN
-  //   Drag DOWN = increase windowHalf = zoom OUT
-  //   Start of first drag uses windowHalfAuto as baseline.
+  // ─ Y-axis drag ─────────────────────────────────────────────────
   function bindAxisDrag() {
     const strip = document.getElementById('bm-axis-drag');
     if (!strip) return;
-
     strip.addEventListener('mousedown', e => {
       e.preventDefault();
-      axisDragging       = true;
-      axisDragStartY     = e.clientY;
-      axisDragStartHalf  = windowHalf ?? windowHalfAuto ?? (tickSize ? tickSize * cfg.levels : 500);
+      axisDragging   = true;
+      axisDragStartY = e.clientY;
+      axisDragStartH = windowHalf ?? windowHalfAuto ?? (tickSize ? tickSize * cfg.levels : 500);
       strip.classList.add('dragging');
     });
-
     window.addEventListener('mousemove', e => {
       if (!axisDragging) return;
-      const dy   = e.clientY - axisDragStartY;   // positive = drag down = zoom out
-      const sens = axisDragStartHalf / 150;        // 150px = 1× range
-      const newH = Math.max(
-        tickSize ? tickSize * 5 : 1,              // min = 5 ticks
-        axisDragStartHalf + dy * sens
-      );
+      const dy   = e.clientY - axisDragStartY;
+      const sens = axisDragStartH / 150;
+      const newH = Math.max(tickSize ? tickSize * 5 : 1, axisDragStartH + dy * sens);
       windowHalf = newH;
-      userZoom   = true;
-      setOverlayRange(newH);
+      userZoomY  = true;
+      setEl('ov-range', newH.toFixed(newH > 100 ? 0 : 2));
       dirty = true;
     });
-
     window.addEventListener('mouseup', () => {
       if (!axisDragging) return;
       axisDragging = false;
       document.getElementById('bm-axis-drag')?.classList.remove('dragging');
     });
-
-    // Double-click axis → reset to auto-fit
     strip.addEventListener('dblclick', () => {
-      userZoom   = false;
+      userZoomY  = false;
       windowHalf = windowHalfAuto;
       dirty      = true;
     });
   }
 
-  function setOverlayRange(half) {
-    setEl('ov-range', half ? half.toFixed(half > 100 ? 0 : 2) : '—');
+  // ─ X-axis scroll zoom ───────────────────────────────────────────
+  //   wheelUp   → xZoomMul ↓ → narrower cols → more history visible
+  //   wheelDown → xZoomMul ↑ → wider  cols → less history (zoom in)
+  function bindScrollZoom() {
+    if (!wrap) return;
+    wrap.addEventListener('wheel', e => {
+      e.preventDefault();
+      const factor = e.deltaY > 0 ? 1.1 : 0.9;   // down=out, up=in
+      xZoomMul = Math.max(0.2, Math.min(8, xZoomMul * factor));
+      dirty = true;
+    }, { passive: false });
   }
 
   const setEl = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
@@ -245,18 +266,16 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Auto-fit window ───────────────────────────────────────────
-  //   Compute windowHalf so all live orderbook levels are visible.
+  // ─ Auto-fit Y window ──────────────────────────────────────────
   function fitWindow(bids, asks) {
-    if (!bids.length || !asks.length) return;
+    if (!bids.length || !asks.length || !midPrice) return;
     const lowestBid  = parseFloat(bids[bids.length - 1].px);
     const highestAsk = parseFloat(asks[asks.length - 1].px);
-    if (!midPrice) return;
     const half = Math.max(midPrice - lowestBid, highestAsk - midPrice) * 1.05;
     windowHalfAuto = half;
-    if (!userZoom) {
+    if (!userZoomY) {
       windowHalf = half;
-      setOverlayRange(half);
+      setEl('ov-range', half.toFixed(half > 100 ? 0 : 2));
     }
   }
 
@@ -264,22 +283,18 @@ window.BookmapPage = (() => {
     if (midPrice === null || !windowHalf) return H / 2;
     const lo = midPrice - windowHalf;
     const hi = midPrice + windowHalf;
-    return H - ((price - lo) / (hi - lo)) * H;
+    return (H - TS_BAR_H) - ((price - lo) / (hi - lo)) * (H - TS_BAR_H);
   }
 
-  // ── Book ──────────────────────────────────────────────────────
+  // ─ Book handler ───────────────────────────────────────────────
   function onBook(msg) {
     const bids = msg.bids || [], asks = msg.asks || [];
     if (!bids.length && !asks.length) return;
     latest.bids = bids; latest.asks = asks;
 
-    // Detect tick size from first two bid levels
     if (!tickSize && bids.length >= 2) {
       const t = Math.abs(parseFloat(bids[0].px) - parseFloat(bids[1].px));
-      if (t > 0) {
-        tickSize = t;
-        setEl('ov-tick', 'Δ' + tickSize.toFixed(tickSize < 10 ? 2 : 1));
-      }
+      if (t > 0) { tickSize = t; setEl('ov-tick', 'Δ' + tickSize.toFixed(tickSize < 10 ? 2 : 1)); }
     }
 
     if (bids.length && asks.length) {
@@ -290,12 +305,12 @@ window.BookmapPage = (() => {
       if (se) se.textContent = 'sprd ' + (ba - bb).toFixed((ba - bb) < 1 ? 4 : 1);
     }
 
-    // Auto-fit (updates windowHalf if not user-overridden)
     fitWindow(bids, asks);
 
     if (midPrice !== null && windowHalf !== null) {
       colBuf.push({
         mid:  midPrice,
+        ts:   Date.now(),
         bids: bids.slice(0, cfg.levels).map(b => ({ px: parseFloat(b.px), sz: parseFloat(b.sz) })),
         asks: asks.slice(0, cfg.levels).map(a => ({ px: parseFloat(a.px), sz: parseFloat(a.sz) })),
       });
@@ -308,10 +323,11 @@ window.BookmapPage = (() => {
 
   function onTrades(msg) {
     if (!W || !H || midPrice === null) return;
-    const nx = Math.floor((W - 58) * 0.85);
+    const AXIS_W = 58;
+    const nx = Math.floor((W - AXIS_W) * 0.85);
     for (const t of (msg.trades || [])) {
       const y = py(parseFloat(t.px));
-      if (y < 0 || y > H) continue;
+      if (y < 0 || y > H - TS_BAR_H) continue;
       const r = Math.min(cfg.maxBubble, Math.max(3, Math.sqrt(parseFloat(t.sz)) * 2));
       bubbles.push({ x: nx, y, r, side: t.side, alpha: 0.9, bot: false });
     }
@@ -319,7 +335,7 @@ window.BookmapPage = (() => {
     dirty = true;
   }
 
-  // ── Bot state ─────────────────────────────────────────────────
+  // ─ Bot state ──────────────────────────────────────────────────
   function onBotState(msg) {
     bot.running   = msg.running   || false;
     bot.bid_quote = msg.bid_quote ?? null;
@@ -336,7 +352,7 @@ window.BookmapPage = (() => {
       if (badge) { badge.textContent = 'BOT LIVE'; badge.classList.add('live'); }
     } else {
       ov?.classList.add('hidden');
-      if (badge) { badge.textContent = 'BOT OFF';  badge.classList.remove('live'); }
+      if (badge) { badge.textContent = 'BOT OFF'; badge.classList.remove('live'); }
     }
 
     const f = (v, d) => typeof v === 'number' ? v.toFixed(d) : '—';
@@ -349,18 +365,19 @@ window.BookmapPage = (() => {
     setEl('bov-ask',    f(bot.ask_quote, midPrice > 100 ? 1 : 4));
 
     if (msg.recent_fills?.length) {
-      const nx = Math.floor((W - 58) * 0.85);
-      for (const f of msg.recent_fills.slice(0, 2)) {
-        if (!f.price) continue;
-        const y = py(f.price);
-        if (y < 0 || y > H) continue;
-        bubbles.push({ x: nx, y, r: 12, side: f.side === 'bid' ? 'B' : 'A', alpha: 1.0, bot: true });
+      const AXIS_W = 58;
+      const nx = Math.floor((W - AXIS_W) * 0.85);
+      for (const fi of msg.recent_fills.slice(0, 2)) {
+        if (!fi.price) continue;
+        const y = py(fi.price);
+        if (y < 0 || y > H - TS_BAR_H) continue;
+        bubbles.push({ x: nx, y, r: 12, side: fi.side === 'bid' ? 'B' : 'A', alpha: 1.0, bot: true });
       }
     }
     dirty = true;
   }
 
-  // ── Orderbook panel ───────────────────────────────────────────
+  // ─ Orderbook panel ────────────────────────────────────────────
   function updateOrderbook() {
     const asksEl = document.getElementById('bm-ob-asks');
     const bidsEl = document.getElementById('bm-ob-bids');
@@ -386,19 +403,25 @@ window.BookmapPage = (() => {
   function resetState() {
     colBuf.length = 0; bubbles.length = 0;
     midPrice = null; tickSize = null;
-    windowHalf = null; windowHalfAuto = null; userZoom = false;
+    windowHalf = null; windowHalfAuto = null; userZoomY = false;
+    xZoomMul = 1.0;
     latest.bids = []; latest.asks = [];
     setEl('bm-price', '—'); setEl('ov-tick', '—'); setEl('ov-range', '—');
     ['bm-ob-asks','bm-ob-bids'].forEach(id => { const e = document.getElementById(id); if(e) e.innerHTML = ''; });
     setEl('bm-ob-mid', '—');
   }
 
-  // ── Render loop ───────────────────────────────────────────────
+  // ─ Render loop ───────────────────────────────────────────────
   function startLoop() {
-    (function loop() {
-      if (dirty) { render(); dirty = false; }
-      requestAnimationFrame(loop);
-    })();
+    (function loop() { if (dirty) { render(); dirty = false; } requestAnimationFrame(loop); })();
+  }
+
+  // Timestamp formatter
+  function fmtTime(ms) {
+    const d = new Date(ms);
+    return d.getHours().toString().padStart(2,'0') + ':'
+         + d.getMinutes().toString().padStart(2,'0') + ':'
+         + d.getSeconds().toString().padStart(2,'0');
   }
 
   function render() {
@@ -406,65 +429,114 @@ window.BookmapPage = (() => {
     ctx.clearRect(0, 0, W, H);
     if (!colBuf.length || !windowHalf || midPrice === null) return;
 
-    const AXIS_W  = 58;
-    const HEAT_W  = W - AXIS_W;
-    const newestX = Math.floor(HEAT_W * 0.85);
-    const numCols = colBuf.length;
-    const visCols = Math.floor(newestX / cfg.colWidth) + 1;
+    const AXIS_W   = 58;
+    const HEAT_W   = W - AXIS_W;
+    const CHART_H  = H - TS_BAR_H;
+    const newestX  = Math.floor(HEAT_W * 0.85);   // live line position
+    const colPx    = Math.max(1, Math.round(cfg.colWidth * xZoomMul));
+    const numCols  = colBuf.length;
+    const visCols  = Math.floor(newestX / colPx) + 1;
     const startIdx = Math.max(0, numCols - visCols);
 
-    let maxSz = 0;
+    // Compute max size ONLY among visible columns for threshold
+    // Threshold = contrastFrac * p90 size (so outliers don’t squash the rest)
+    const allSizes = [];
     for (let i = startIdx; i < numCols; i++) {
       const s = colBuf[i];
-      for (const b of s.bids) b.sz > maxSz && (maxSz = b.sz);
-      for (const a of s.asks) a.sz > maxSz && (maxSz = a.sz);
+      for (const b of s.bids) allSizes.push(b.sz);
+      for (const a of s.asks) allSizes.push(a.sz);
     }
-    if (!maxSz) maxSz = 1;
-    const thr = contrast * maxSz;
-    const rh  = Math.max(1, (H / (windowHalf * 2)) * (tickSize || 1));
+    let p90 = 1;
+    if (allSizes.length) {
+      allSizes.sort((a, b) => a - b);
+      p90 = allSizes[Math.floor(allSizes.length * 0.9)] || 1;
+    }
+    const threshold = contrastFrac * p90;   // absolute size cutoff
+    const normRef   = p90;                   // normalise colours to p90
 
-    // Background grid
+    const rh = Math.max(1, (CHART_H / (windowHalf * 2)) * (tickSize || 1));
+
+    // ─ Grid lines ───────────────────────────────────────────
     ctx.strokeStyle = 'rgba(30,30,50,0.5)'; ctx.lineWidth = 1;
     for (let i = 0; i <= 10; i++) {
-      const y = Math.round((i / 10) * H);
+      const y = Math.round((i / 10) * CHART_H);
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(HEAT_W, y); ctx.stroke();
     }
 
-    // Heatmap columns
+    // ─ Heatmap columns ──────────────────────────────────────
     for (let col = 0; col < visCols; col++) {
-      const si = startIdx + col;
+      const si   = startIdx + col;
       if (si >= numCols) break;
       const snap = colBuf[si];
-      const x    = newestX - (numCols - 1 - si) * cfg.colWidth;
-      if (x + cfg.colWidth < 0) continue;
+      const x    = newestX - (numCols - 1 - si) * colPx;
+      if (x + colPx < 0) continue;
+
+      const isLive = (si === numCols - 1);
+
       for (const b of snap.bids) {
-        if (b.sz < thr) continue;
-        ctx.fillStyle = bidColor(b.sz / maxSz);
-        ctx.fillRect(x, py(b.px) - rh * 0.5, cfg.colWidth, rh);
+        if (b.sz < threshold) continue;
+        const n = Math.min(1, b.sz / normRef);
+        ctx.fillStyle = isLive ? liveBidColor(n) : histBidColor(n);
+        ctx.fillRect(x, py(b.px) - rh * 0.5, colPx, rh);
       }
       for (const a of snap.asks) {
-        if (a.sz < thr) continue;
-        ctx.fillStyle = askColor(a.sz / maxSz);
-        ctx.fillRect(x, py(a.px) - rh * 0.5, cfg.colWidth, rh);
+        if (a.sz < threshold) continue;
+        const n = Math.min(1, a.sz / normRef);
+        ctx.fillStyle = isLive ? liveAskColor(n) : histAskColor(n);
+        ctx.fillRect(x, py(a.px) - rh * 0.5, colPx, rh);
       }
     }
 
-    // Mid price dashed line
+    // ─ Delta column (rightmost, after newestX) ───────────────
+    // For each price level in the live snapshot: delta = bidSz − askSz
+    if (numCols > 0) {
+      const snap    = colBuf[numCols - 1];
+      const deltaX  = newestX + colPx + 2;
+      const deltaW  = Math.min(14, AXIS_W - 4);
+
+      // Build map by price level
+      const bidMap = new Map();
+      for (const b of snap.bids) bidMap.set(b.px, b.sz);
+      const askMap = new Map();
+      for (const a of snap.asks) askMap.set(a.px, a.sz);
+
+      // All unique prices
+      const prices = [...new Set([...bidMap.keys(), ...askMap.keys()])];
+      let maxDelta = 0;
+      for (const px of prices) {
+        const d = Math.abs((bidMap.get(px) || 0) - (askMap.get(px) || 0));
+        if (d > maxDelta) maxDelta = d;
+      }
+      if (maxDelta > 0) {
+        for (const px of prices) {
+          const bidSz = bidMap.get(px) || 0;
+          const askSz = askMap.get(px) || 0;
+          const delta = bidSz - askSz;
+          if (Math.abs(delta) < threshold) continue;
+          const n  = Math.abs(delta) / maxDelta;
+          const y  = py(px);
+          if (y < 0 || y > CHART_H) continue;
+          ctx.fillStyle = delta > 0 ? deltaBidCol(0.3 + n * 0.7) : deltaAskCol(0.3 + n * 0.7);
+          ctx.fillRect(deltaX, y - rh * 0.5, deltaW * n, rh);
+        }
+      }
+    }
+
+    // ─ Mid price line ────────────────────────────────────────
     const midY = py(midPrice);
     ctx.beginPath(); ctx.strokeStyle = 'rgba(122,162,247,0.9)';
     ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-    ctx.moveTo(0, midY); ctx.lineTo(newestX + cfg.colWidth, midY);
+    ctx.moveTo(0, midY); ctx.lineTo(newestX + colPx, midY);
     ctx.stroke(); ctx.setLineDash([]);
 
-    // Bot quote lines
+    // ─ Bot quote lines ─────────────────────────────────────
     if (bot.running && bot.bid_quote !== null && bot.ask_quote !== null) {
-      const bidY = py(bot.bid_quote);
-      const askY = py(bot.ask_quote);
+      const bidY = py(bot.bid_quote), askY = py(bot.ask_quote);
       ctx.lineWidth = 1.5; ctx.setLineDash([6, 3]);
       ctx.beginPath(); ctx.strokeStyle = 'rgba(0,210,180,0.9)';
-      ctx.moveTo(0, bidY); ctx.lineTo(newestX + cfg.colWidth, bidY); ctx.stroke();
+      ctx.moveTo(0, bidY); ctx.lineTo(newestX + colPx, bidY); ctx.stroke();
       ctx.beginPath(); ctx.strokeStyle = 'rgba(255,120,80,0.9)';
-      ctx.moveTo(0, askY); ctx.lineTo(newestX + cfg.colWidth, askY); ctx.stroke();
+      ctx.moveTo(0, askY); ctx.lineTo(newestX + colPx, askY); ctx.stroke();
       ctx.setLineDash([]);
       ctx.font = '10px Inter,monospace'; ctx.textAlign = 'right';
       ctx.fillStyle = 'rgba(0,210,180,1)';
@@ -474,33 +546,52 @@ window.BookmapPage = (() => {
       ctx.textAlign = 'left';
     }
 
-    // Price axis background
-    ctx.fillStyle = 'rgba(10,10,20,0.75)';
-    ctx.fillRect(HEAT_W, 0, AXIS_W, H);
+    // ─ Timestamp bar ────────────────────────────────────────
+    ctx.fillStyle = 'rgba(13,13,30,0.9)';
+    ctx.fillRect(0, CHART_H, HEAT_W, TS_BAR_H);
     ctx.beginPath(); ctx.strokeStyle = 'rgba(30,30,50,0.8)'; ctx.lineWidth = 1;
+    ctx.moveTo(0, CHART_H); ctx.lineTo(HEAT_W, CHART_H); ctx.stroke();
+
+    // Draw timestamps every ~120px
+    const tsInterval = Math.max(1, Math.round(120 / colPx));
+    ctx.font = '9px Inter,monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(108,112,134,0.9)';
+    for (let col = 0; col < visCols; col += tsInterval) {
+      const si = startIdx + col;
+      if (si >= numCols) break;
+      const x = newestX - (numCols - 1 - si) * colPx;
+      if (x < 30 || x > HEAT_W - 10) continue;
+      ctx.fillText(fmtTime(colBuf[si].ts), x, CHART_H + 13);
+      // Tick mark
+      ctx.beginPath(); ctx.strokeStyle = 'rgba(60,60,80,0.6)';
+      ctx.moveTo(x, CHART_H); ctx.lineTo(x, CHART_H + 4); ctx.stroke();
+    }
+
+    // ─ Price axis ───────────────────────────────────────────
+    ctx.fillStyle = 'rgba(10,10,20,0.8)';
+    ctx.fillRect(HEAT_W, 0, AXIS_W, H);
+    ctx.beginPath(); ctx.strokeStyle = 'rgba(30,30,50,0.9)'; ctx.lineWidth = 1;
     ctx.moveTo(HEAT_W, 0); ctx.lineTo(HEAT_W, H); ctx.stroke();
 
-    // Price labels on axis
     const lo    = midPrice - windowHalf;
     const range = windowHalf * 2;
     ctx.font = '10px Inter,monospace'; ctx.textAlign = 'left';
     for (let i = 0; i <= 12; i++) {
       const price = lo + (range / 12) * i;
-      const y     = H  - (i / 12) * H;
+      const y     = CHART_H - (i / 12) * CHART_H;
       ctx.fillStyle = 'rgba(108,112,134,0.9)';
       ctx.fillText(price.toFixed(price > 100 ? 1 : 4), HEAT_W + 4, y + 3);
     }
-    // Mid label in accent colour
     ctx.fillStyle = 'rgba(122,162,247,1)'; ctx.font = '11px Inter,monospace';
     ctx.fillText(midPrice.toFixed(midPrice > 100 ? 1 : 4), HEAT_W + 4, midY + 4);
 
-    // Drag-zoom cursor hint on axis
+    // Axis drag highlight
     if (axisDragging) {
-      ctx.fillStyle = 'rgba(122,162,247,0.15)';
-      ctx.fillRect(HEAT_W, 0, AXIS_W, H);
+      ctx.fillStyle = 'rgba(122,162,247,0.12)';
+      ctx.fillRect(HEAT_W, 0, AXIS_W, CHART_H);
     }
 
-    // Trade bubbles
+    // ─ Trade bubbles ─────────────────────────────────────────
     for (let i = bubbles.length - 1; i >= 0; i--) {
       const b = bubbles[i];
       if (b.alpha <= 0) { bubbles.splice(i, 1); continue; }
@@ -515,9 +606,9 @@ window.BookmapPage = (() => {
     if (bubbles.length) dirty = true;
   }
 
-  // ── Public ────────────────────────────────────────────────────
-  function onShow()         { resize(); dirty = true; }
-  function onConnected()    {
+  // ─ Public ────────────────────────────────────────────────────
+  function onShow() { resize(); dirty = true; }
+  function onConnected() {
     document.getElementById('bm-dot')?.classList.add('live');
     setEl('bm-status-text', 'Live');
     document.getElementById('bm-waiting')?.classList.add('hidden');
